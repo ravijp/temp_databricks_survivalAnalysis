@@ -1,455 +1,280 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # ADP Employee Turnover Project - Table Access Testing
+# MAGIC # ADP Quick Access Diagnostic - CRITICAL ISSUE RESOLUTION
 # MAGIC 
-# MAGIC **Purpose:** Test access to Analytics Warehouse tables for survival analysis project
-# MAGIC 
-# MAGIC **Usage:**
-# MAGIC 1. Add your table names to the `table_list` variable
-# MAGIC 2. Run all cells to get comprehensive access report
-# MAGIC 3. Share results with Blair/Dinesh for any access issues
+# MAGIC **Problem Identified:** Schema permission issues blocking table access
+# MAGIC **Priority:** IMMEDIATE escalation required
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Setup and Configuration
+# MAGIC ## 1. Basic Environment Check
 
 # COMMAND ----------
 
 import pandas as pd
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-import time
 from datetime import datetime
 
-# Initialize Spark session
 spark = SparkSession.builder.getOrCreate()
 
-print("🔧 Environment Setup Complete")
+print("🔧 ENVIRONMENT DIAGNOSTIC")
+print("=" * 40)
+print(f"Timestamp: {datetime.now()}")
 print(f"Spark Version: {spark.version}")
-print(f"Test started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"User: {spark.sparkContext.sparkUser()}")
+print(f"App Name: {spark.sparkContext.appName}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Table List Configuration
-# MAGIC 
-# MAGIC **Instructions:** Replace the sample table names below with your actual ADP Analytics Warehouse table names
+# MAGIC ## 2. Catalog/Schema Permissions Test
 
 # COMMAND ----------
 
-# ADD YOUR TABLE NAMES HERE
-# Format: "catalog.schema.table_name"
-table_list = [
-    # Example format - replace with your actual table names
-    "your_catalog.your_schema.employee_data",
-    "your_catalog.your_schema.termination_events", 
-    "your_catalog.your_schema.salary_history",
-    "your_catalog.your_schema.promotion_history",
-    "your_catalog.your_schema.manager_assignments",
-    "your_catalog.your_schema.department_mappings",
-    "your_catalog.your_schema.naics_classifications",
-    "your_catalog.your_schema.performance_ratings",
-    "your_catalog.your_schema.overtime_records",
-    "your_catalog.your_schema.remote_work_data"
-]
+def test_basic_catalog_access():
+    """
+    Test basic catalog and schema access before testing individual tables
+    """
+    print("🔍 CATALOG ACCESS DIAGNOSTIC")
+    print("=" * 50)
+    
+    # Test 1: Can we list catalogs?
+    try:
+        catalogs = spark.sql("SHOW CATALOGS").collect()
+        print("✅ Can list catalogs:")
+        for catalog in catalogs:
+            print(f"   - {catalog['catalog']}")
+    except Exception as e:
+        print(f"❌ Cannot list catalogs: {str(e)}")
+        return False
+    
+    # Test 2: Can we list schemas in each catalog?
+    print(f"\n🗂️  SCHEMA ACCESS TEST:")
+    accessible_schemas = []
+    
+    for catalog in catalogs:
+        catalog_name = catalog['catalog']
+        try:
+            schemas = spark.sql(f"SHOW SCHEMAS IN {catalog_name}").collect()
+            print(f"✅ {catalog_name}: {len(schemas)} schemas")
+            for schema in schemas[:3]:  # Show first 3
+                schema_full = f"{catalog_name}.{schema['databaseName']}"
+                accessible_schemas.append(schema_full)
+                print(f"   - {schema_full}")
+            if len(schemas) > 3:
+                print(f"   ... and {len(schemas)-3} more")
+        except Exception as e:
+            print(f"❌ {catalog_name}: {str(e)[:100]}...")
+    
+    return accessible_schemas
 
-print(f"📋 Testing access to {len(table_list)} tables:")
-for i, table in enumerate(table_list, 1):
-    print(f"  {i}. {table}")
+accessible_schemas = test_basic_catalog_access()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Table Access Testing Functions
+# MAGIC ## 3. Test Specific ADP Schema Access
 
 # COMMAND ----------
 
-def test_table_exists(table_name):
+def test_adp_specific_access():
     """
-    Test if table exists and is accessible
-    Returns: (exists, error_message)
+    Test access to likely ADP schema patterns
     """
-    try:
-        # Try to get table info
-        spark.sql(f"DESCRIBE TABLE {table_name}")
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-def test_table_read_access(table_name):
-    """
-    Test if we can read from the table
-    Returns: (can_read, row_count, error_message)
-    """
-    try:
-        # Try to count rows (lightweight operation)
-        df = spark.sql(f"SELECT COUNT(*) as row_count FROM {table_name}")
-        row_count = df.collect()[0]['row_count']
-        return True, row_count, None
-    except Exception as e:
-        return False, None, str(e)
-
-def get_table_schema(table_name):
-    """
-    Get table schema information
-    Returns: (success, schema_info, error_message)
-    """
-    try:
-        schema_df = spark.sql(f"DESCRIBE TABLE {table_name}")
-        schema_info = schema_df.collect()
-        return True, schema_info, None
-    except Exception as e:
-        return False, None, str(e)
-
-def get_sample_data(table_name, limit=5):
-    """
-    Get sample data from table
-    Returns: (success, sample_data, error_message)
-    """
-    try:
-        sample_df = spark.sql(f"SELECT * FROM {table_name} LIMIT {limit}")
-        sample_data = sample_df.collect()
-        return True, sample_data, None
-    except Exception as e:
-        return False, None, str(e)
-
-print("✅ Table testing functions defined")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. Comprehensive Table Access Test
-
-# COMMAND ----------
-
-def run_comprehensive_table_test(table_list):
-    """
-    Run comprehensive access test on all tables
-    """
+    print("🎯 ADP-SPECIFIC SCHEMA ACCESS TEST")
+    print("=" * 45)
     
-    results = []
-    
-    print("🧪 Starting Comprehensive Table Access Test")
-    print("=" * 60)
-    
-    for i, table_name in enumerate(table_list, 1):
-        print(f"\n📊 Testing Table {i}/{len(table_list)}: {table_name}")
-        print("-" * 50)
-        
-        result = {
-            'table_name': table_name,
-            'test_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'exists': False,
-            'readable': False,
-            'row_count': None,
-            'column_count': None,
-            'columns': [],
-            'sample_available': False,
-            'errors': []
-        }
-        
-        # Test 1: Table Exists
-        exists, exist_error = test_table_exists(table_name)
-        result['exists'] = exists
-        
-        if not exists:
-            print(f"❌ Table does not exist or not accessible")
-            print(f"   Error: {exist_error}")
-            result['errors'].append(f"Existence check failed: {exist_error}")
-            results.append(result)
-            continue
-        else:
-            print("✅ Table exists and is accessible")
-        
-        # Test 2: Read Access
-        can_read, row_count, read_error = test_table_read_access(table_name)
-        result['readable'] = can_read
-        result['row_count'] = row_count
-        
-        if not can_read:
-            print(f"❌ Cannot read from table")
-            print(f"   Error: {read_error}")
-            result['errors'].append(f"Read access failed: {read_error}")
-        else:
-            print(f"✅ Read access confirmed - {row_count:,} rows")
-        
-        # Test 3: Schema Information
-        schema_success, schema_info, schema_error = get_table_schema(table_name)
-        if schema_success:
-            columns = [row['col_name'] for row in schema_info if row['col_name'] and not row['col_name'].startswith('#')]
-            result['columns'] = columns
-            result['column_count'] = len(columns)
-            print(f"✅ Schema retrieved - {len(columns)} columns")
-            print(f"   Columns: {', '.join(columns[:5])}{'...' if len(columns) > 5 else ''}")
-        else:
-            print(f"⚠️  Could not retrieve schema: {schema_error}")
-            result['errors'].append(f"Schema retrieval failed: {schema_error}")
-        
-        # Test 4: Sample Data (only if read access works)
-        if can_read:
-            sample_success, sample_data, sample_error = get_sample_data(table_name, 3)
-            result['sample_available'] = sample_success
-            if sample_success:
-                print(f"✅ Sample data retrieved - {len(sample_data)} sample rows")
-            else:
-                print(f"⚠️  Could not retrieve sample data: {sample_error}")
-                result['errors'].append(f"Sample data failed: {sample_error}")
-        
-        results.append(result)
-        
-        # Small delay to avoid overwhelming the system
-        time.sleep(0.5)
-    
-    return results
-
-# Run the comprehensive test
-test_results = run_comprehensive_table_test(table_list)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Test Results Summary
-
-# COMMAND ----------
-
-def generate_access_summary(test_results):
-    """
-    Generate comprehensive access summary
-    """
-    
-    print("📋 TABLE ACCESS SUMMARY REPORT")
-    print("=" * 60)
-    print(f"Test completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Total tables tested: {len(test_results)}")
-    
-    # Overall statistics
-    accessible_count = sum(1 for r in test_results if r['exists'] and r['readable'])
-    exists_count = sum(1 for r in test_results if r['exists'])
-    readable_count = sum(1 for r in test_results if r['readable'])
-    
-    print(f"\n📊 OVERALL STATISTICS:")
-    print(f"  Tables that exist: {exists_count}/{len(test_results)} ({exists_count/len(test_results)*100:.1f}%)")
-    print(f"  Tables readable: {readable_count}/{len(test_results)} ({readable_count/len(test_results)*100:.1f}%)")
-    print(f"  Fully accessible: {accessible_count}/{len(test_results)} ({accessible_count/len(test_results)*100:.1f}%)")
-    
-    # Detailed results
-    print(f"\n📋 DETAILED RESULTS:")
-    
-    # Successful tables
-    successful_tables = [r for r in test_results if r['exists'] and r['readable']]
-    if successful_tables:
-        print(f"\n✅ ACCESSIBLE TABLES ({len(successful_tables)}):")
-        for result in successful_tables:
-            row_count_str = f"{result['row_count']:,}" if result['row_count'] is not None else "Unknown"
-            col_count_str = str(result['column_count']) if result['column_count'] is not None else "Unknown"
-            print(f"  📊 {result['table_name']}")
-            print(f"      Rows: {row_count_str} | Columns: {col_count_str}")
-            if result['columns']:
-                print(f"      Sample columns: {', '.join(result['columns'][:3])}{'...' if len(result['columns']) > 3 else ''}")
-    
-    # Failed tables
-    failed_tables = [r for r in test_results if not (r['exists'] and r['readable'])]
-    if failed_tables:
-        print(f"\n❌ INACCESSIBLE TABLES ({len(failed_tables)}):")
-        for result in failed_tables:
-            print(f"  🚫 {result['table_name']}")
-            if result['errors']:
-                for error in result['errors']:
-                    print(f"      Error: {error}")
-    
-    # Data availability summary for survival analysis
-    print(f"\n🧬 SURVIVAL ANALYSIS DATA READINESS:")
-    
-    # Look for key tables needed for survival analysis
-    key_table_indicators = [
-        'employee', 'termination', 'salary', 'promotion', 
-        'manager', 'department', 'performance', 'overtime'
+    # Common ADP schema patterns (adjust based on your actual names)
+    potential_adp_schemas = [
+        "onedata_us_east_1_shared_prod.us_east_1_prd_ds_blue_raw",  # From your error
+        "onedata_us_east_1_shared_prod.employee_data",
+        "adp_analytics.employee_data", 
+        "analytics.employee_data",
+        "prod.employee_data",
+        "shared_prod.analytics"
     ]
     
-    available_key_data = []
-    for indicator in key_table_indicators:
-        matching_tables = [r for r in successful_tables 
-                          if any(indicator in r['table_name'].lower() 
-                                for indicator in [indicator])]
-        if matching_tables:
-            available_key_data.append(f"{indicator.title()}: ✅")
-        else:
-            available_key_data.append(f"{indicator.title()}: ❌")
+    working_schemas = []
     
-    for item in available_key_data:
-        print(f"  {item}")
+    for schema in potential_adp_schemas:
+        try:
+            # Test USE SCHEMA permission
+            spark.sql(f"USE {schema}")
+            print(f"✅ {schema}: USE permission granted")
+            
+            # Test listing tables
+            tables = spark.sql(f"SHOW TABLES IN {schema}").collect()
+            print(f"   📊 {len(tables)} tables found")
+            working_schemas.append(schema)
+            
+            # Show first few table names
+            for table in tables[:3]:
+                print(f"   - {table['tableName']}")
+            if len(tables) > 3:
+                print(f"   ... and {len(tables)-3} more")
+                
+        except Exception as e:
+            error_msg = str(e)
+            if "PERMISSION_DENIED" in error_msg:
+                print(f"❌ {schema}: PERMISSION DENIED")
+            elif "not found" in error_msg.lower():
+                print(f"⚠️  {schema}: Schema not found")
+            else:
+                print(f"❌ {schema}: {error_msg[:80]}...")
+    
+    return working_schemas
+
+working_schemas = test_adp_specific_access()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Quick Sample Table Test
+
+# COMMAND ----------
+
+def test_sample_tables(working_schemas):
+    """
+    Quick test of actual data access in working schemas
+    """
+    if not working_schemas:
+        print("❌ No accessible schemas found - cannot test tables")
+        return []
+    
+    print("📋 SAMPLE TABLE ACCESS TEST")
+    print("=" * 40)
+    
+    accessible_tables = []
+    
+    for schema in working_schemas[:2]:  # Test first 2 working schemas
+        try:
+            tables = spark.sql(f"SHOW TABLES IN {schema}").collect()
+            
+            # Test first few tables
+            for table in tables[:3]:
+                table_name = f"{schema}.{table['tableName']}"
+                try:
+                    # Quick row count test
+                    count_result = spark.sql(f"SELECT COUNT(*) as cnt FROM {table_name}").collect()
+                    row_count = count_result[0]['cnt']
+                    print(f"✅ {table_name}: {row_count:,} rows")
+                    accessible_tables.append({
+                        'table': table_name,
+                        'rows': row_count,
+                        'schema': schema
+                    })
+                except Exception as e:
+                    print(f"❌ {table_name}: {str(e)[:60]}...")
+                    
+        except Exception as e:
+            print(f"❌ Schema {schema}: {str(e)[:60]}...")
+    
+    return accessible_tables
+
+accessible_tables = test_sample_tables(working_schemas)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Critical Issue Summary & Next Steps
+
+# COMMAND ----------
+
+def generate_critical_issue_summary(accessible_schemas, accessible_tables):
+    """
+    Generate immediate action summary for critical access issues
+    """
+    
+    print("🚨 CRITICAL ISSUE SUMMARY")
+    print("=" * 50)
+    print(f"Test completed: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Status assessment
+    if len(accessible_tables) >= 5:
+        status = "🟡 PARTIAL ACCESS - Can proceed with available data"
+        priority = "Medium - Continue development, escalate for full access"
+    elif len(accessible_tables) >= 1:
+        status = "🟠 LIMITED ACCESS - Minimal viable dataset"
+        priority = "High - Immediate escalation needed"
+    else:
+        status = "🔴 NO DATA ACCESS - Project blocked"
+        priority = "CRITICAL - Emergency escalation required"
+    
+    print(f"Status: {status}")
+    print(f"Priority: {priority}")
+    
+    print(f"\n📊 ACCESS SUMMARY:")
+    print(f"  Accessible schemas: {len(accessible_schemas)}")
+    print(f"  Accessible tables: {len(accessible_tables)}")
+    
+    if accessible_schemas:
+        print(f"\n✅ WORKING SCHEMAS:")
+        for schema in accessible_schemas:
+            print(f"  - {schema}")
+    
+    if accessible_tables:
+        print(f"\n✅ ACCESSIBLE TABLES:")
+        for table_info in accessible_tables:
+            print(f"  - {table_info['table']}: {table_info['rows']:,} rows")
+    
+    # Immediate actions
+    print(f"\n🎯 IMMEDIATE ACTIONS:")
+    
+    if len(accessible_tables) == 0:
+        print("  1. 🚨 EMERGENCY: Contact Blair immediately")
+        print("  2. 📧 CC: George + Account Lead on escalation")  
+        print("  3. ⏰ Request: Emergency access resolution meeting")
+        print("  4. 📋 Prepare: Timeline impact assessment")
+        
+    elif len(accessible_tables) < 5:
+        print("  1. 📞 Contact Blair for additional schema access")
+        print("  2. 🔄 Begin limited development with available tables")
+        print("  3. 📋 Document minimum viable dataset requirements")
+        print("  4. ⏱️  Set 24-hour resolution target for full access")
+        
+    else:
+        print("  1. ✅ Begin data exploration with accessible tables")
+        print("  2. 📞 Contact Blair for any missing critical tables")
+        print("  3. 📋 Document accessible dataset for team")
+    
+    # Contact information
+    print(f"\n📞 ESCALATION CONTACTS:")
+    print("  Blair Christian - blair.christian@adp.com")
+    print("  Dinesh Prodduturi - dinesh.prodduturi@adp.com") 
+    print("  George Hatziemanuel - george.hatziemanuel@adp.com")
+    
+    # Email template
+    print(f"\n📧 EMERGENCY EMAIL TEMPLATE:")
+    print("Subject: URGENT - ADP Turnover Project Schema Access Issues")
+    print("")
+    print("Hi Blair,")
+    print("")
+    print(f"Critical access issue blocking ADP turnover project:")
+    print(f"- Error: PERMISSION_DENIED on schema access")
+    print(f"- Impact: {len(accessible_tables)} of expected tables accessible")
+    print(f"- Timeline risk: Week 1 deliverables at risk")
+    print("")
+    print("Specific error from testing:")
+    print("PERMISSION_DENIED: user does not have USE SCHEMA on Schema")
+    print("")
+    print("Request immediate resolution to maintain 4-week delivery timeline.")
+    print("")
+    print("Available for emergency call to resolve.")
+    print("Ravi & Zenon Team")
     
     return {
-        'total_tables': len(test_results),
-        'accessible_tables': accessible_count,
-        'success_rate': accessible_count/len(test_results)*100,
-        'successful_tables': successful_tables,
-        'failed_tables': failed_tables
+        'status': status,
+        'accessible_schemas': len(accessible_schemas),
+        'accessible_tables': len(accessible_tables),
+        'priority': priority
     }
 
 # Generate summary
-summary = generate_access_summary(test_results)
+summary = generate_critical_issue_summary(accessible_schemas, accessible_tables)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 6. Export Results for Team Sharing
-
-# COMMAND ----------
-
-# Create detailed results DataFrame for easy sharing
-def create_results_dataframe(test_results):
-    """
-    Create a pandas DataFrame with test results for easy export/sharing
-    """
-    
-    df_data = []
-    for result in test_results:
-        df_data.append({
-            'Table_Name': result['table_name'],
-            'Exists': '✅' if result['exists'] else '❌',
-            'Readable': '✅' if result['readable'] else '❌',
-            'Row_Count': result['row_count'],
-            'Column_Count': result['column_count'],
-            'Status': 'ACCESSIBLE' if (result['exists'] and result['readable']) else 'BLOCKED',
-            'Error_Summary': '; '.join(result['errors']) if result['errors'] else 'None',
-            'Test_Time': result['test_timestamp']
-        })
-    
-    return pd.DataFrame(df_data)
-
-# Create results DataFrame
-results_df = create_results_dataframe(test_results)
-
-print("📊 EXPORTABLE RESULTS TABLE:")
-print("=" * 40)
-display(results_df)
-
-# Export to temporary view for easy querying
-results_spark_df = spark.createDataFrame(results_df)
-results_spark_df.createOrReplaceTempView("table_access_results")
-
-print("\n💾 Results saved to temporary view: 'table_access_results'")
-print("Use: SELECT * FROM table_access_results WHERE Status = 'BLOCKED' to see blocked tables")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 7. Action Items and Next Steps
-
-# COMMAND ----------
-
-def generate_action_items(summary):
-    """
-    Generate specific action items based on test results
-    """
-    
-    print("🎯 ACTION ITEMS AND NEXT STEPS")
-    print("=" * 50)
-    
-    success_rate = summary['success_rate']
-    
-    if success_rate == 100:
-        print("🎉 EXCELLENT: All tables accessible!")
-        print("\n✅ IMMEDIATE ACTIONS:")
-        print("  1. Begin data exploration phase")
-        print("  2. Start feature engineering pipeline development")
-        print("  3. Initialize survival analysis data preparation")
-        
-    elif success_rate >= 70:
-        print("🟡 GOOD: Most tables accessible")
-        print(f"   {summary['accessible_tables']}/{summary['total_tables']} tables available")
-        print("\n✅ IMMEDIATE ACTIONS:")
-        print("  1. Begin work with accessible tables")
-        print("  2. Contact Blair/Dinesh for blocked table access")
-        print("  3. Identify critical missing tables for survival analysis")
-        
-    elif success_rate >= 30:
-        print("🟠 PARTIAL: Some tables accessible")
-        print(f"   {summary['accessible_tables']}/{summary['total_tables']} tables available")
-        print("\n⚠️  CRITICAL ACTIONS:")
-        print("  1. ESCALATE: Contact Blair immediately for access resolution")
-        print("  2. Identify minimum viable dataset for Week 1 progress")
-        print("  3. Prepare alternative data sources if needed")
-        
-    else:
-        print("🔴 CRITICAL: Most/all tables blocked")
-        print(f"   Only {summary['accessible_tables']}/{summary['total_tables']} tables available")
-        print("\n🚨 URGENT ACTIONS:")
-        print("  1. IMMEDIATE ESCALATION: Contact Blair + Account Lead")
-        print("  2. Schedule emergency access resolution meeting")
-        print("  3. Prepare project timeline impact assessment")
-    
-    # Specific contacts and next steps
-    print(f"\n📞 ESCALATION CONTACTS:")
-    print("  1. Blair Christian (Director of Data Science) - Primary technical contact")
-    print("  2. Dinesh Prodduturi (Data Engineering Manager) - Analytics Warehouse expert")
-    print("  3. George Hatziemanuel (Product Manager) - For access authorization")
-    
-    print(f"\n📧 RECOMMENDED EMAIL TEMPLATE:")
-    print("Subject: ADP Turnover Project - Table Access Status")
-    print(f"Hi Blair/Dinesh,")
-    print(f"")
-    print(f"Table access test completed for ADP employee turnover project:")
-    print(f"- Total tables tested: {summary['total_tables']}")
-    print(f"- Accessible tables: {summary['accessible_tables']} ({success_rate:.1f}%)")
-    print(f"- Status: {'Ready to proceed' if success_rate >= 70 else 'Need access resolution'}")
-    print(f"")
-    print(f"See attached results for detailed breakdown.")
-    print(f"{'Ready to begin data exploration!' if success_rate >= 70 else 'Please advise on access resolution timeline.'}")
-    print(f"")
-    print(f"Best regards,")
-    print(f"Ravi & Zenon Team")
-
-# Generate action items
-generate_action_items(summary)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 8. Save Results for Team Reference
-
-# COMMAND ----------
-
-# Save timestamp for reference
-test_completion_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-print("💾 TABLE ACCESS TEST COMPLETED")
-print("=" * 40)
-print(f"Completion time: {test_completion_time}")
-print(f"Results available in: 'table_access_results' temp view")
-print(f"Total tables tested: {len(test_results)}")
-print(f"Success rate: {summary['success_rate']:.1f}%")
-
-# Quick status for team standup
-if summary['success_rate'] >= 70:
-    status_emoji = "🟢"
-    status_text = "GREEN - Ready to proceed"
-elif summary['success_rate'] >= 30:
-    status_emoji = "🟡"  
-    status_text = "YELLOW - Partial access, needs resolution"
-else:
-    status_emoji = "🔴"
-    status_text = "RED - Critical access issues"
-
-print(f"\n{status_emoji} TEAM STATUS: {status_text}")
-print("\n📋 Copy this summary for standup:")
-print(f"Table Access Test: {summary['accessible_tables']}/{summary['total_tables']} tables accessible ({summary['success_rate']:.1f}%) - {status_text}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC 
-# MAGIC ## Usage Instructions
-# MAGIC 
-# MAGIC 1. **Replace table names** in Section 2 with your actual ADP Analytics Warehouse table names
-# MAGIC 2. **Run all cells** to execute comprehensive access testing
-# MAGIC 3. **Check results** in Section 5 for detailed summary
-# MAGIC 4. **Follow action items** in Section 7 based on your access status
-# MAGIC 5. **Share results** with Blair/Dinesh if access issues found
-# MAGIC 
-# MAGIC **Table Name Format:** `catalog.schema.table_name`
-# MAGIC 
-# MAGIC **Example:** `adp_analytics.employee_data.current_employees`
+print("⏰ QUICK DIAGNOSTIC COMPLETE")
+print("Copy above summary for immediate Blair escalation")
+print("Focus on schema permissions, not individual table access")
