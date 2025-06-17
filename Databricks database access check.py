@@ -1,21 +1,21 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Comprehensive ADP Access Test - Find/Replace Aliases
+# MAGIC # Comprehensive ZENON Access Test - Find/Replace Aliases
 # MAGIC 
-# MAGIC **FIND AND REPLACE THESE ALIASES WITH YOUR ACTUAL ADP NAMES:**
+# MAGIC **FIND AND REPLACE THESE ALIASES WITH YOUR ACTUAL ZENON NAMES:**
 # MAGIC 
 # MAGIC | Alias | Replace With Your Actual Name |
 # MAGIC |-------|------------------------------|
-# MAGIC | `ADP_CATALOG_1` | your_catalog_name |
-# MAGIC | `ADP_SCHEMA_1` | your_first_schema_name |
-# MAGIC | `ADP_SCHEMA_2` | your_second_schema_name |
-# MAGIC | `ADP_SCHEMA_3` | your_third_schema_name |
-# MAGIC | `ADP_SCHEMA_4` | your_fourth_schema_name |
-# MAGIC | `ADP_SCHEMA_5` | your_fifth_schema_name |
-# MAGIC | `ADP_SCHEMA_6` | your_sixth_schema_name |
-# MAGIC | `ADP_TABLE_1` | your_first_table_name |
-# MAGIC | `ADP_TABLE_2` | your_second_table_name |
-# MAGIC | `ADP_TABLE_3` | your_third_table_name |
+# MAGIC | `ZENON_CATALOG_1` | your_catalog_name |
+# MAGIC | `ZENON_SCHEMA_1` | your_first_schema_name |
+# MAGIC | `ZENON_SCHEMA_2` | your_second_schema_name |
+# MAGIC | `ZENON_SCHEMA_3` | your_third_schema_name |
+# MAGIC | `ZENON_SCHEMA_4` | your_fourth_schema_name |
+# MAGIC | `ZENON_SCHEMA_5` | your_fifth_schema_name |
+# MAGIC | `ZENON_SCHEMA_6` | your_sixth_schema_name |
+# MAGIC | `ZENON_TABLE_1` | your_first_table_name |
+# MAGIC | `ZENON_TABLE_2` | your_second_table_name |
+# MAGIC | `ZENON_TABLE_3` | your_third_table_name |
 
 # COMMAND ----------
 
@@ -125,23 +125,23 @@ except Exception as e:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. ADP Schema Access Testing
+# MAGIC ## 4. ZENON Schema Access Testing
 
 # COMMAND ----------
 
-# Define your ADP schemas here - REPLACE THESE ALIASES!
-adp_schemas = [
-    "ADP_SCHEMA_1",  # Replace with actual schema name
-    "ADP_SCHEMA_2",  # Replace with actual schema name  
-    "ADP_SCHEMA_3",  # Replace with actual schema name
-    "ADP_SCHEMA_4",  # Replace with actual schema name
-    "ADP_SCHEMA_5",  # Replace with actual schema name
-    "ADP_SCHEMA_6"   # Replace with actual schema name
+# Define your ZENON schemas here - REPLACE THESE ALIASES!
+ZENON_schemas = [
+    "ZENON_SCHEMA_1",  # Replace with actual schema name
+    "ZENON_SCHEMA_2",  # Replace with actual schema name  
+    "ZENON_SCHEMA_3",  # Replace with actual schema name
+    "ZENON_SCHEMA_4",  # Replace with actual schema name
+    "ZENON_SCHEMA_5",  # Replace with actual schema name
+    "ZENON_SCHEMA_6"   # Replace with actual schema name
 ]
 
 schema_results = []
 
-for schema in adp_schemas:
+for schema in ZENON_schemas:
     result = {
         'Schema_Name': schema,
         'Exists': 'Unknown',
@@ -264,15 +264,15 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Specific ADP Table Testing
+# MAGIC ## 6. Specific ZENON Table Testing
 
 # COMMAND ----------
 
 # Test specific important tables - REPLACE THESE ALIASES!
 important_tables = [
-    "ADP_SCHEMA_1.ADP_TABLE_1",  # Replace with actual schema.table
-    "ADP_SCHEMA_1.ADP_TABLE_2",  # Replace with actual schema.table
-    "ADP_SCHEMA_2.ADP_TABLE_3",  # Replace with actual schema.table
+    "ZENON_SCHEMA_1.ZENON_TABLE_1",  # Replace with actual schema.table
+    "ZENON_SCHEMA_1.ZENON_TABLE_2",  # Replace with actual schema.table
+    "ZENON_SCHEMA_2.ZENON_TABLE_3",  # Replace with actual schema.table
 ]
 
 specific_table_results = []
@@ -450,7 +450,7 @@ display(pd.DataFrame(summary_stats))
 
 # COMMAND ----------
 
-# Assess impact on ADP project timeline
+# Assess impact on ZENON project timeline
 business_impact = []
 
 # Data availability assessment

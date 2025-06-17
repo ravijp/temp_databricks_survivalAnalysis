@@ -9,7 +9,7 @@
 - **Covariates:** Age, gender, job satisfaction, environment satisfaction, education field, job role, income, overtime, percentage salary hike, tenure, training times, years in current role, relationship status
 - **Quality:** Clean, well-documented, business-relevant features
 - **Format:** Cross-sectional (can be adapted for time-varying analysis)
-- **ADP Relevance:** Perfect for initial model validation and business context understanding
+- **ZENON Relevance:** Perfect for initial model validation and business context understanding
 
 ### **2. Edward Babushkin's Employee Dataset**
 - **Source:** Edward's Dropbox (mirror available)
@@ -17,13 +17,13 @@
 - **Features:** Personality traits (independence, self-control, anxiety, openness), demographic data
 - **Context:** Call-center environment with high turnover rates
 - **Use Case:** Survival analysis examples included
-- **ADP Relevance:** ⭐⭐⭐⭐ (Real-world employee data with survival analysis applications)
+- **ZENON Relevance:** ⭐⭐⭐⭐ (Real-world employee data with survival analysis applications)
 
 ### **3. Employee Turnover Dataset (Kaggle)**
 - **Source:** https://www.kaggle.com/datasets/davinwijaya/employee-turnover
 - **Description:** Originally used for Survival Analysis Model
 - **Format:** Designed specifically for survival analysis
-- **ADP Relevance:** ⭐⭐⭐⭐⭐ (Direct survival analysis application)
+- **ZENON Relevance:** ⭐⭐⭐⭐⭐ (Direct survival analysis application)
 
 ---
 
@@ -153,9 +153,9 @@ df_spark = spark.read.csv("path/to/dataset.csv", header=True, schema=survival_sc
 
 ---
 
-## **Recommended Testing Sequence for ADP Project**
+## **Recommended Testing Sequence for ZENON Project**
 
-### **Phase 1: Foundation (Week 1 - Before ADP Access)**
+### **Phase 1: Foundation (Week 1 - Before ZENON Access)**
 1. **IBM HR Analytics Dataset** - Understand business context and basic survival concepts
 2. **Rossi Dataset** - Master start-stop format and time-varying covariates
 3. **GBSG2 Dataset** - Validate Cox PH implementation against known results
@@ -163,7 +163,7 @@ df_spark = spark.read.csv("path/to/dataset.csv", header=True, schema=survival_sc
 ### **Phase 2: Scale Testing (Week 1-2)**
 1. **Telco Churn Dataset** - Test larger scale (7K+ records) and competing risks
 2. **Stanford Heart Transplant** - Complex time-varying scenarios
-3. **Custom Employee Simulation** - ADP-specific format practice
+3. **Custom Employee Simulation** - ZENON-specific format practice
 
 ### **Phase 3: Production Readiness (Week 2-3)**
 1. **TCGA Subset** - Large-scale survival analysis (1K+ patients, 100+ features)
@@ -233,4 +233,4 @@ def validate_survival_implementation(df, known_results=None):
     return validation_results
 ```
 
-This comprehensive list provides real, accessible datasets that progress from basic survival analysis concepts to production-scale employee turnover modeling, perfectly aligned with your ADP project requirements and PySpark implementation needs.
+This comprehensive list provides real, accessible datasets that progress from basic survival analysis concepts to production-scale employee turnover modeling, perfectly aligned with your ZENON project requirements and PySpark implementation needs.

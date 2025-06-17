@@ -677,7 +677,7 @@ def data_requirements():
 
 ---
 
-## **6. Why T/S/X Learners Don't Apply to ADP Project**
+## **6. Why T/S/X Learners Don't Apply to ZENON Project**
 
 ### **Fundamental Incompatibility Issues**
 
@@ -686,7 +686,7 @@ def data_requirements():
 # T/S/X learners expect:
 outcome_format = "Binary (0/1) or continuous (real numbers)"
 
-# ADP project has:
+# ZENON project has:
 survival_outcome = {
     'type': 'time-to-event',
     'components': ['time_to_termination', 'event_indicator'],
@@ -702,8 +702,8 @@ print("INCOMPATIBLE: Meta-learners can't handle survival outcomes")
 # T/S/X learners answer:
 meta_learner_question = "What's the treatment effect?" (single number)
 
-# ADP needs to answer:
-adp_questions = [
+# ZENON needs to answer:
+ZENON_questions = [
     "What's the treatment effect at 6 months?",
     "What's the treatment effect at 12 months?", 
     "What's the treatment effect at 18 months?",
@@ -716,7 +716,7 @@ print("INCOMPATIBLE: Meta-learners ignore time dimension")
 
 #### **3. Censoring Not Handled**
 ```python
-# ADP reality:
+# ZENON reality:
 total_employees = 1000000
 still_employed = 650000  # Right-censored observations
 terminated = 350000      # Observed events
@@ -731,7 +731,7 @@ print("INCOMPATIBLE: Meta-learners waste censored data")
 
 #### **4. No Competing Risks**
 ```python
-# ADP termination types:
+# ZENON termination types:
 termination_types = {
     'voluntary': 0.45,      # Target outcome
     'involuntary': 0.30,    # Competing risk
@@ -754,8 +754,8 @@ print("INCOMPATIBLE: Meta-learners ignore competing risks")
 meta_output = "Treatment effect = 0.15"
 # HR Manager asks: "What does 0.15 mean? Should I give John a raise?"
 
-# ADP G-computation output:
-adp_output = {
+# ZENON G-computation output:
+ZENON_output = {
     'employee': 'John Smith',
     'current_12m_retention': 0.65,
     'with_salary_increase': 0.78,
@@ -771,7 +771,7 @@ print("Meta-learners don't provide actionable business insights")
 
 #### **2. Missing Time Horizons**
 ```python
-# ADP business need:
+# ZENON business need:
 retention_targets = {
     '6_month': 0.85,   # Onboarding success
     '12_month': 0.75,  # Annual retention target
@@ -808,8 +808,8 @@ meta_format = pd.DataFrame({
     'outcome': [0, 1, 0]  # Binary: stayed/left
 })
 
-# ADP survival format:
-adp_format = pd.DataFrame({
+# ZENON survival format:
+ZENON_format = pd.DataFrame({
     'employee_id': [1, 1, 1, 2, 2],
     'start_time': [0, 6, 12, 0, 6],
     'stop_time': [6, 12, 18, 6, 10],
@@ -828,7 +828,7 @@ print("Data formats fundamentally incompatible")
 meta_features = ['age', 'education', 'salary', 'treatment']
 # Static snapshot at one time point
 
-# ADP survival features:
+# ZENON survival features:
 survival_features = [
     'current_age',           # Changes over time
     'tenure_months',         # Increases over time  
@@ -859,7 +859,7 @@ print("Performance evaluation frameworks incompatible")
 
 ### **The Correct Path Forward**
 
-Instead of T/S/X learners, ADP project uses:
+Instead of T/S/X learners, ZENON project uses:
 
 ```python
 # Correct approach: G-computation for survival analysis
@@ -880,7 +880,7 @@ business_value = [
     'Actionable HR recommendations'
 ]
 
-print("G-computation provides what ADP actually needs")
+print("G-computation provides what ZENON actually needs")
 ```
 
 ---
@@ -892,13 +892,13 @@ print("G-computation provides what ADP actually needs")
 - **S-Learner**: Good for small samples, homogeneous effects  
 - **X-Learner**: Good for imbalanced treatments, highest accuracy
 
-### **For ADP Project:**
+### **For ZENON Project:**
 - **Abandon meta-learner approach** - fundamentally incompatible
 - **Use G-computation with survival models** - designed for time-to-event data
 - **Focus on Cox PH and XGBoost AFT** - correct modeling framework
 - **Generate survival probabilities** - what HR practitioners need
 
 ### **Key Takeaway:**
-Meta-learners are powerful tools for standard causal inference, but they're the wrong tool for survival analysis problems. The ADP project requires specialized survival analysis methods that can handle time-to-event outcomes, censoring, and time-varying covariates.
+Meta-learners are powerful tools for standard causal inference, but they're the wrong tool for survival analysis problems. The ZENON project requires specialized survival analysis methods that can handle time-to-event outcomes, censoring, and time-varying covariates.
 
-The confusion arose from mixing different causal inference paradigms. Understanding both approaches helps clarify why the chosen G-computation framework is correct for ADP's business needs.
+The confusion arose from mixing different causal inference paradigms. Understanding both approaches helps clarify why the chosen G-computation framework is correct for ZENON's business needs.

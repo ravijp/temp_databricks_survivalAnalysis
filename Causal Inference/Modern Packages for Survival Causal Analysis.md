@@ -38,7 +38,7 @@ pip install optuna>=3.3.0              # Hyperparameter optimization
 
 ## **Package Comparison Matrix**
 
-| Package | Strength | Use Case | ADP Relevance |
+| Package | Strength | Use Case | ZENON Relevance |
 |---------|----------|----------|---------------|
 | **lifelines** | Classical survival analysis | Cox PH, AFT, baseline | Core modeling |
 | **scikit-survival** | ML integration | Random Survival Forest | Ensemble methods |
@@ -139,7 +139,7 @@ pip install jupyter notebook ipywidgets  # For interactive notebooks
 
 ## **Recommended Package Combinations**
 
-### **For ADP-style Projects**
+### **For ZENON-style Projects**
 ```python
 # Core survival modeling
 import lifelines

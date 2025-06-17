@@ -1,16 +1,16 @@
-# Causal Inference for ADP Employee Turnover Project
+# Causal Inference for ZENON Employee Turnover Project
 ## Complete Technical Guide for Survival Analysis Context
 
 ---
 
 ## **1. Introduction: Causal Inference vs. Prediction**
 
-### **Why Causal Inference Matters for ADP**
+### **Why Causal Inference Matters for ZENON**
 
 **Prediction Problem**: "Who will leave in the next 12 months?" (Correlational)
 **Causal Problem**: "What interventions will reduce John's turnover risk?" (Actionable)
 
-ADP's business need is **causal**: HR practitioners want to know **what actions to take**, not just who's at risk. This requires causal inference, not just predictive modeling.
+ZENON's business need is **causal**: HR practitioners want to know **what actions to take**, not just who's at risk. This requires causal inference, not just predictive modeling.
 
 ### **Fundamental Causal Question**
 > "If we give John a 10% salary increase, how much will his 12-month retention probability improve?"
@@ -19,7 +19,7 @@ This question requires estimating **counterfactual outcomes** - what would happe
 
 ---
 
-## **2. G-Computation: The Correct Approach for ADP**
+## **2. G-Computation: The Correct Approach for ZENON**
 
 ### **What is G-Computation?**
 
@@ -55,7 +55,7 @@ Where:
 - ATE(t) = treatment effect on survival probability at time t
 ```
 
-### **Step-by-Step G-Computation for ADP**
+### **Step-by-Step G-Computation for ZENON**
 
 #### **Step 1: Fit Survival Model with Confounders**
 ```python
@@ -144,7 +144,7 @@ ranked_interventions = sorted(intervention_effects.items(),
                             key=lambda x: x[1], reverse=True)
 ```
 
-### **G-Computation Advantages for ADP**
+### **G-Computation Advantages for ZENON**
 
 1. **Handles Survival Data**: Works with time-to-event outcomes and censoring
 2. **Multiple Time Horizons**: Can estimate effects at 6, 12, 18 months simultaneously
@@ -321,38 +321,38 @@ ate = ite.mean()
 
 ---
 
-## **4. Why T/S/X Learners Don't Apply to ADP Project**
+## **4. Why T/S/X Learners Don't Apply to ZENON Project**
 
 ### **Fundamental Incompatibility**
 
 #### **1. Outcome Type Mismatch**
 - **T/S/X Learners**: Designed for binary or continuous outcomes
-- **ADP Problem**: Time-to-event outcome (survival time)
+- **ZENON Problem**: Time-to-event outcome (survival time)
 - **Issue**: Can't handle censoring, competing risks, or time-varying effects
 
 #### **2. Time Dimension Ignored**
 - **T/S/X Learners**: Single time point analysis
-- **ADP Need**: Multiple time horizons (6-month, 12-month predictions)
+- **ZENON Need**: Multiple time horizons (6-month, 12-month predictions)
 - **Issue**: Don't capture when treatment effects occur or how they change over time
 
 #### **3. Censoring Not Handled**
 - **T/S/X Learners**: Assume all outcomes are observed
-- **ADP Reality**: Many employees haven't left yet (right-censored)
+- **ZENON Reality**: Many employees haven't left yet (right-censored)
 - **Issue**: Would require dropping censored employees, losing valuable information
 
 #### **4. No Competing Risks**
 - **T/S/X Learners**: Single outcome type
-- **ADP Context**: Voluntary termination vs. involuntary vs. retirement vs. transfer
+- **ZENON Context**: Voluntary termination vs. involuntary vs. retirement vs. transfer
 - **Issue**: Can't distinguish between different types of "leaving"
 
-### **Specific ADP Business Incompatibilities**
+### **Specific ZENON Business Incompatibilities**
 
 #### **Wrong Business Question**
 ```python
 # What T/S/X learners answer:
 "If John gets a salary increase, will he leave or stay?" (Binary)
 
-# What ADP needs to know:
+# What ZENON needs to know:
 "If John gets a salary increase, how much longer will he stay?" (Time)
 "What's his retention probability at 6, 12, 18 months?" (Multiple horizons)
 ```
@@ -362,7 +362,7 @@ ate = ite.mean()
 # T/S/X learner approach (WRONG):
 features = ['initial_salary', 'hire_date_performance', 'starting_manager']
 
-# ADP reality (CORRECT):
+# ZENON reality (CORRECT):
 # Employee characteristics change over time:
 # - Salary increases throughout tenure
 # - Performance ratings change
@@ -375,7 +375,7 @@ features = ['initial_salary', 'hire_date_performance', 'starting_manager']
 # T/S/X learner output:
 "John's treatment effect = 0.15" (What does this mean for HR?)
 
-# ADP business need:
+# ZENON business need:
 "John's 12-month retention probability increases from 65% to 78% with salary increase"
 "ROI: $8,500 cost, $45,000 replacement saving → 5.3x return"
 ```
@@ -389,7 +389,7 @@ employee_id | age | salary | treatment | outcome
 1          | 35  | 75000  | 1         | 0 (stayed)
 2          | 42  | 82000  | 0         | 1 (left)
 
-# ADP survival data format:
+# ZENON survival data format:
 employee_id | start | stop | age | salary | treatment | event
 1          | 0     | 6    | 35  | 75000  | 0         | 0
 1          | 6     | 12   | 35  | 80000  | 1         | 0  
@@ -411,7 +411,7 @@ employee_id | start | stop | age | salary | treatment | event
 
 ---
 
-## **5. Correct Implementation Path for ADP**
+## **5. Correct Implementation Path for ZENON**
 
 ### **Week 2: Foundation (Current Priority)**
 1. **Implement G-computation with Cox models**
@@ -479,4 +479,4 @@ intervention_recommendations = {
 - **Statistical**: Valid causal assumptions and robust effect estimates  
 - **Business**: Actionable intervention recommendations with ROI analysis
 
-The ADP project requires **causal inference for survival analysis**, not standard treatment effect estimation. G-computation provides the right framework for generating actionable, time-aware intervention recommendations that ADP's HR practitioners need.
+The ZENON project requires **causal inference for survival analysis**, not standard treatment effect estimation. G-computation provides the right framework for generating actionable, time-aware intervention recommendations that ZENON's HR practitioners need.

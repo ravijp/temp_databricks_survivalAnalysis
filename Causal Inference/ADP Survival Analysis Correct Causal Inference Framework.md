@@ -1,4 +1,4 @@
-# ADP Survival Analysis: Correct Causal Inference Framework
+# ZENON Survival Analysis: Correct Causal Inference Framework
 
 ## **The Confusion: T/S/X Learners vs. G-Computation**
 
@@ -7,14 +7,14 @@
 - **Standard Treatment Effect**: Single time point, binary treatment
 - **DoWhy Example**: Lalonde dataset (employment program evaluation)
 
-### **What ADP Project Actually Uses (CORRECT):**
+### **What ZENON Project Actually Uses (CORRECT):**
 - **G-Computation for Survival**: Causal inference with time-to-event data
 - **Survival Treatment Effects**: How interventions affect time-to-turnover
 - **Multiple Time Horizons**: 6-month, 12-month survival impacts
 
 ---
 
-## **Correct ADP Implementation: G-Computation for Survival**
+## **Correct ZENON Implementation: G-Computation for Survival**
 
 ### **Step 1: Define Causal Framework**
 ```
@@ -68,16 +68,16 @@ ite_12m = survival_treated.loc[12] - survival_control.loc[12]
 
 ---
 
-## **Why This Approach Fits ADP Business Needs**
+## **Why This Approach Fits ZENON Business Needs**
 
 ### **Business Question Alignment**
-✅ **ADP Question**: "What's the retention impact of giving John a 10% raise?"
+✅ **ZENON Question**: "What's the retention impact of giving John a 10% raise?"
 ✅ **G-Computation Answer**: "John's 12-month retention probability increases from 65% to 78%"
 
 ❌ **T-Learner Question**: "What's John's counterfactual outcome under treatment?"
-❌ **Wrong for ADP**: Doesn't handle time-to-event or competing risks
+❌ **Wrong for ZENON**: Doesn't handle time-to-event or competing risks
 
-### **Intervention Types for ADP**
+### **Intervention Types for ZENON**
 1. **Salary Increases**: 5%, 10%, 15% scenarios
 2. **Promotion Timing**: Immediate vs. 6-month delay
 3. **Overtime Reduction**: 10%, 20%, 30% reduction
@@ -122,7 +122,7 @@ ROI Analysis:
 
 ---
 
-## **Critical Causal Assumptions for ADP**
+## **Critical Causal Assumptions for ZENON**
 
 ### **SUTVA (Stable Unit Treatment Value Assumption)**
 ✅ **No Interference**: One employee's salary increase doesn't affect another's turnover
@@ -134,11 +134,11 @@ ROI Analysis:
 
 ### **Positivity**
 ✅ **Sufficient Overlap**: Employees across all confounder patterns can receive treatment
-✅ **ADP Context**: Salary increases possible across all employee types
+✅ **ZENON Context**: Salary increases possible across all employee types
 
 ---
 
-## **Key Deliverables for ADP**
+## **Key Deliverables for ZENON**
 
 ### **Technical Outputs**
 1. **ATE Estimates**: Population-level intervention impacts
@@ -157,7 +157,7 @@ ROI Analysis:
 ## **Bottom Line**
 
 **Radhika's T/S/X learner approach is for standard causal inference problems.**
-**ADP project uses G-computation within survival analysis framework.**
+**ZENON project uses G-computation within survival analysis framework.**
 **The confusion comes from mixing different causal inference paradigms.**
 
 **Correct approach: G-computation → Survival models → Treatment effects on time-to-turnover**

@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # ADP Employee Turnover - Databricks Starter Template
+# MAGIC # ZENON Employee Turnover - Databricks Starter Template
 # MAGIC ### For team members new to Databricks/PySpark
 # MAGIC 
 # MAGIC **Key Databricks Concepts for Our Project:**
@@ -50,7 +50,7 @@ print(f"Available cores: {spark.sparkContext.defaultParallelism}")
 # Template for connecting to Analytics Warehouse
 def connect_to_analytics_warehouse():
     """
-    Template function to connect to ADP Analytics Warehouse
+    Template function to connect to ZENON Analytics Warehouse
     Replace with actual connection details once catalog access is confirmed
     """
     try:
@@ -215,7 +215,7 @@ survival_model = run_basic_survival_analysis(sample_df)
 def assess_data_quality(df):
     """
     Comprehensive data quality assessment specific to survival analysis
-    Focus on issues identified in ADP project context
+    Focus on issues identified in ZENON project context
     """
     
     print("🔍 Data Quality Assessment for Survival Analysis")
@@ -273,7 +273,7 @@ quality_metrics = assess_data_quality(sample_df)
 def track_model_performance(y_true, y_pred, model_name):
     """
     Template for tracking survival model performance
-    Focus on metrics relevant to ADP business requirements
+    Focus on metrics relevant to ZENON business requirements
     """
     
     from lifelines.utils import concordance_index
