@@ -1,562 +1,227 @@
-# Databricks notebook source
-# MAGIC %md
-# MAGIC # Comprehensive ZENON Access Test - Find/Replace Aliases
-# MAGIC 
-# MAGIC **FIND AND REPLACE THESE ALIASES WITH YOUR ACTUAL ZENON NAMES:**
-# MAGIC 
-# MAGIC | Alias | Replace With Your Actual Name |
-# MAGIC |-------|------------------------------|
-# MAGIC | `ZENON_CATALOG_1` | your_catalog_name |
-# MAGIC | `ZENON_SCHEMA_1` | your_first_schema_name |
-# MAGIC | `ZENON_SCHEMA_2` | your_second_schema_name |
-# MAGIC | `ZENON_SCHEMA_3` | your_third_schema_name |
-# MAGIC | `ZENON_SCHEMA_4` | your_fourth_schema_name |
-# MAGIC | `ZENON_SCHEMA_5` | your_fifth_schema_name |
-# MAGIC | `ZENON_SCHEMA_6` | your_sixth_schema_name |
-# MAGIC | `ZENON_TABLE_1` | your_first_table_name |
-# MAGIC | `ZENON_TABLE_2` | your_second_table_name |
-# MAGIC | `ZENON_TABLE_3` | your_third_table_name |
+# ============================================================================
+# DATABRICKS TABLE ACCESS CHECKER
+# ============================================================================
 
-# COMMAND ----------
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.utils import AnalysisException
 
-# MAGIC %md
-# MAGIC ## 1. Environment Setup and Basic Tests
+# Initialize Spark (already available in Databricks)
+# spark = SparkSession.builder.getOrCreate()  # Uncomment if needed
 
-# COMMAND ----------
-
-import pandas as pd
-from datetime import datetime
-import traceback
-
-# Environment information
-env_info = [{
-    'Component': 'Spark Version',
-    'Value': spark.version,
-    'Status': '✅ Working',
-    'Timestamp': datetime.now().strftime('%H:%M:%S')
-}, {
-    'Component': 'Current User',
-    'Value': spark.sparkContext.sparkUser(),
-    'Status': '✅ Working', 
-    'Timestamp': datetime.now().strftime('%H:%M:%S')
-}, {
-    'Component': 'Default Parallelism',
-    'Value': str(spark.sparkContext.defaultParallelism),
-    'Status': '✅ Working',
-    'Timestamp': datetime.now().strftime('%H:%M:%S')
-}]
-
-display(pd.DataFrame(env_info))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 2. Catalog Discovery and Access
-
-# COMMAND ----------
-
-# Get all available catalogs
-try:
-    catalogs_df = spark.sql("SHOW CATALOGS")
-    display(catalogs_df)
+def check_table_access(table_list):
+    """
+    Check access to a list of tables and fetch single record from each
     
-    # Summary of catalogs
-    catalog_count = catalogs_df.count()
-    catalog_summary = [{
-        'Metric': 'Total Catalogs Available',
-        'Count': catalog_count,
-        'Status': '✅ Catalog Access Working'
-    }]
-    display(pd.DataFrame(catalog_summary))
+    Args:
+        table_list: List of table names (can include catalog.schema.table format)
+    """
     
-except Exception as e:
-    error_info = [{
-        'Error_Type': 'Catalog Access Failed',
-        'Error_Message': str(e),
-        'Status': '❌ Critical Issue'
-    }]
-    display(pd.DataFrame(error_info))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 3. Current Location and Permissions
-
-# COMMAND ----------
-
-# Check current database context
-try:
-    current_info = []
+    results = {}
     
-    # Current catalog
-    current_cat = spark.sql("SELECT current_catalog() as catalog").collect()[0]['catalog']
-    current_info.append({
-        'Setting': 'Current Catalog',
-        'Value': current_cat,
-        'Status': '✅ Accessible'
-    })
+    print("🔍 CHECKING TABLE ACCESS")
+    print("=" * 50)
     
-    # Current schema  
-    current_schema = spark.sql("SELECT current_schema() as schema").collect()[0]['schema']
-    current_info.append({
-        'Setting': 'Current Schema',
-        'Value': current_schema, 
-        'Status': '✅ Accessible'
-    })
-    
-    # Current timestamp
-    current_ts = spark.sql("SELECT current_timestamp() as ts").collect()[0]['ts']
-    current_info.append({
-        'Setting': 'Current Timestamp',
-        'Value': str(current_ts),
-        'Status': '✅ Working'
-    })
-    
-    display(pd.DataFrame(current_info))
-    
-except Exception as e:
-    error_info = [{
-        'Error_Type': 'Current Context Failed',
-        'Error_Message': str(e),
-        'Status': '❌ Basic Access Issue'
-    }]
-    display(pd.DataFrame(error_info))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. ZENON Schema Access Testing
-
-# COMMAND ----------
-
-# Define your ZENON schemas here - REPLACE THESE ALIASES!
-ZENON_schemas = [
-    "ZENON_SCHEMA_1",  # Replace with actual schema name
-    "ZENON_SCHEMA_2",  # Replace with actual schema name  
-    "ZENON_SCHEMA_3",  # Replace with actual schema name
-    "ZENON_SCHEMA_4",  # Replace with actual schema name
-    "ZENON_SCHEMA_5",  # Replace with actual schema name
-    "ZENON_SCHEMA_6"   # Replace with actual schema name
-]
-
-schema_results = []
-
-for schema in ZENON_schemas:
-    result = {
-        'Schema_Name': schema,
-        'Exists': 'Unknown',
-        'USE_Permission': 'Unknown', 
-        'Table_Count': 0,
-        'Error_Details': 'None',
-        'Status': 'Untested'
-    }
-    
-    # Test 1: Schema Existence
-    try:
-        schema_info = spark.sql(f"DESCRIBE SCHEMA {schema}")
-        result['Exists'] = '✅ Yes'
-    except Exception as e:
-        result['Exists'] = '❌ No'
-        result['Error_Details'] = str(e)[:100]
-    
-    # Test 2: USE Permission (only if exists)
-    if result['Exists'] == '✅ Yes':
+    for i, table_name in enumerate(table_list, 1):
+        print(f"\n[{i}/{len(table_list)}] Checking: {table_name}")
+        print("-" * 40)
+        
         try:
-            spark.sql(f"USE {schema}")
-            result['USE_Permission'] = '✅ Yes'
+            # Try to read one record from the table
+            df = spark.table(table_name).limit(1)
             
-            # Test 3: Table Listing (only if USE works)
-            try:
-                tables = spark.sql(f"SHOW TABLES IN {schema}")
-                table_count = tables.count()
-                result['Table_Count'] = table_count
-                result['Status'] = '✅ Full Access'
-            except Exception as e:
-                result['Status'] = '⚠️ USE OK, Tables Failed'
-                result['Error_Details'] = str(e)[:100]
+            # Get record count to verify access
+            count = df.count()
+            
+            if count > 0:
+                # Fetch and display the record
+                record = df.collect()[0]
                 
+                print(f"✅ ACCESS GRANTED")
+                print(f"📊 Sample Record:")
+                
+                # Print each column and value
+                for field in df.schema.fields:
+                    col_name = field.name
+                    col_value = record[col_name]
+                    col_type = str(field.dataType)
+                    print(f"   {col_name}: {col_value} ({col_type})")
+                
+                results[table_name] = {
+                    'status': 'SUCCESS',
+                    'record_count': count,
+                    'columns': len(df.columns),
+                    'schema': [f.name for f in df.schema.fields]
+                }
+                
+            else:
+                print(f"✅ ACCESS GRANTED (Empty Table)")
+                print(f"📊 Columns: {df.columns}")
+                
+                results[table_name] = {
+                    'status': 'SUCCESS_EMPTY', 
+                    'record_count': 0,
+                    'columns': len(df.columns),
+                    'schema': [f.name for f in df.schema.fields]
+                }
+        
+        except AnalysisException as e:
+            error_msg = str(e)
+            
+            if "does not exist" in error_msg.lower():
+                print(f"❌ TABLE NOT FOUND")
+                results[table_name] = {'status': 'NOT_FOUND', 'error': 'Table does not exist'}
+                
+            elif "permission" in error_msg.lower() or "access" in error_msg.lower():
+                print(f"🚫 ACCESS DENIED")
+                results[table_name] = {'status': 'ACCESS_DENIED', 'error': 'Insufficient permissions'}
+                
+            else:
+                print(f"⚠️  ERROR: {error_msg}")
+                results[table_name] = {'status': 'ERROR', 'error': error_msg}
+        
         except Exception as e:
-            result['USE_Permission'] = '❌ No'
-            result['Status'] = '❌ Permission Denied'
-            result['Error_Details'] = str(e)[:100]
-    else:
-        result['Status'] = '❌ Schema Not Found'
+            print(f"⚠️  UNEXPECTED ERROR: {str(e)}")
+            results[table_name] = {'status': 'UNEXPECTED_ERROR', 'error': str(e)}
     
-    schema_results.append(result)
+    return results
 
-# Display comprehensive schema results
-display(pd.DataFrame(schema_results))
+def print_summary(results):
+    """Print summary of table access check results"""
+    
+    print("\n" + "=" * 60)
+    print("📋 SUMMARY REPORT")  
+    print("=" * 60)
+    
+    success_count = sum(1 for r in results.values() if r['status'] in ['SUCCESS', 'SUCCESS_EMPTY'])
+    error_count = len(results) - success_count
+    
+    print(f"Total tables checked: {len(results)}")
+    print(f"✅ Accessible: {success_count}")
+    print(f"❌ Issues: {error_count}")
+    
+    if error_count > 0:
+        print(f"\n🚫 TABLES WITH ISSUES:")
+        for table, result in results.items():
+            if result['status'] not in ['SUCCESS', 'SUCCESS_EMPTY']:
+                status_emoji = {
+                    'NOT_FOUND': '❓',
+                    'ACCESS_DENIED': '🚫', 
+                    'ERROR': '⚠️',
+                    'UNEXPECTED_ERROR': '💥'
+                }
+                emoji = status_emoji.get(result['status'], '❌')
+                print(f"   {emoji} {table}: {result['status']}")
+    
+    print(f"\n✅ ACCESSIBLE TABLES:")
+    for table, result in results.items():
+        if result['status'] in ['SUCCESS', 'SUCCESS_EMPTY']:
+            col_count = result.get('columns', 0)
+            rec_count = result.get('record_count', 0)
+            print(f"   📊 {table}: {col_count} columns, {rec_count} records")
 
-# COMMAND ----------
+# ============================================================================
+# USAGE EXAMPLES
+# ============================================================================
 
-# MAGIC %md  
-# MAGIC ## 5. Table Access Testing for Working Schemas
-
-# COMMAND ----------
-
-# Get schemas that have full access
-working_schemas = [r['Schema_Name'] for r in schema_results if r['Status'] == '✅ Full Access']
-
-table_test_results = []
-
-for schema in working_schemas:
-    try:
-        # Get table list
-        tables_df = spark.sql(f"SHOW TABLES IN {schema}")
-        tables_list = [row['tableName'] for row in tables_df.collect()]
-        
-        # Test first 5 tables in each working schema
-        for table_name in tables_list[:5]:
-            full_table_name = f"{schema}.{table_name}"
-            
-            table_result = {
-                'Schema': schema,
-                'Table_Name': table_name,
-                'Full_Name': full_table_name,
-                'Row_Count': 0,
-                'Column_Count': 0,
-                'Access_Status': 'Unknown',
-                'Error': 'None'
-            }
-            
-            try:
-                # Test row count
-                count_df = spark.sql(f"SELECT COUNT(*) as cnt FROM {full_table_name}")
-                row_count = count_df.collect()[0]['cnt']
-                table_result['Row_Count'] = row_count
-                
-                # Test column count
-                desc_df = spark.sql(f"DESCRIBE TABLE {full_table_name}")
-                col_count = desc_df.count()
-                table_result['Column_Count'] = col_count
-                
-                table_result['Access_Status'] = '✅ Full Access'
-                
-            except Exception as e:
-                table_result['Access_Status'] = '❌ Access Denied'
-                table_result['Error'] = str(e)[:80]
-            
-            table_test_results.append(table_result)
-            
-    except Exception as e:
-        error_result = {
-            'Schema': schema,
-            'Table_Name': 'Schema Error',
-            'Full_Name': schema,
-            'Row_Count': 0,
-            'Column_Count': 0,
-            'Access_Status': '❌ Schema Error',
-            'Error': str(e)[:80]
-        }
-        table_test_results.append(error_result)
-
-# Display table access results
-if table_test_results:
-    display(pd.DataFrame(table_test_results))
-else:
-    no_access_msg = [{
-        'Message': 'No accessible schemas found for table testing',
-        'Status': '❌ Critical Access Issue',
-        'Action_Needed': 'Immediate escalation required'
-    }]
-    display(pd.DataFrame(no_access_msg))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 6. Specific ZENON Table Testing
-
-# COMMAND ----------
-
-# Test specific important tables - REPLACE THESE ALIASES!
-important_tables = [
-    "ZENON_SCHEMA_1.ZENON_TABLE_1",  # Replace with actual schema.table
-    "ZENON_SCHEMA_1.ZENON_TABLE_2",  # Replace with actual schema.table
-    "ZENON_SCHEMA_2.ZENON_TABLE_3",  # Replace with actual schema.table
+# Example 1: Simple table list
+simple_tables = [
+    'employees',
+    'payroll', 
+    'performance_reviews',
+    'org_hierarchy'
 ]
 
-specific_table_results = []
-
-for table in important_tables:
-    result = {
-        'Table_Full_Name': table,
-        'Exists': 'Unknown',
-        'Row_Count': 0,
-        'Sample_Columns': 'None',
-        'Data_Types': 'None',
-        'Status': 'Unknown',
-        'Error': 'None'
-    }
-    
-    try:
-        # Test existence and basic info
-        desc_result = spark.sql(f"DESCRIBE TABLE {table}")
-        columns_info = desc_result.collect()
-        
-        result['Exists'] = '✅ Yes'
-        result['Sample_Columns'] = ', '.join([col['col_name'] for col in columns_info[:5]])
-        result['Data_Types'] = ', '.join([col['data_type'] for col in columns_info[:5]])
-        
-        # Test row count
-        count_result = spark.sql(f"SELECT COUNT(*) as cnt FROM {table}")
-        row_count = count_result.collect()[0]['cnt']
-        result['Row_Count'] = row_count
-        
-        result['Status'] = '✅ Fully Accessible'
-        
-    except Exception as e:
-        result['Exists'] = '❌ No'
-        result['Status'] = '❌ Not Accessible'
-        result['Error'] = str(e)[:100]
-    
-    specific_table_results.append(result)
-
-display(pd.DataFrame(specific_table_results))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 7. Alternative Catalog/Schema Exploration
-
-# COMMAND ----------
-
-# Try common catalog patterns
-alternative_patterns = [
-    "hive_metastore",
-    "main", 
-    "samples",
-    "system",
-    "default"
+# Example 2: Full catalog.schema.table format  
+full_qualified_tables = [
+    'analytics_warehouse.hr.employees',
+    'analytics_warehouse.hr.compensation', 
+    'analytics_warehouse.finance.payroll',
+    'raw_data.adp.workforce_now',
+    'processed.turnover.survival_data'
 ]
 
-alternative_results = []
+# Example 3: Mixed formats
+mixed_tables = [
+    'default.employees',
+    'hr_analytics.employee_turnover',
+    'analytics_warehouse.hr.compensation_history', 
+    'some_catalog.some_schema.some_table',
+    'non_existent_table'
+]
 
-for catalog in alternative_patterns:
-    result = {
-        'Catalog_Name': catalog,
-        'Accessible': 'Unknown',
-        'Schema_Count': 0,
-        'Sample_Schemas': 'None'
-    }
+# ============================================================================
+# RUN THE CHECK
+# ============================================================================
+
+if __name__ == "__main__":
     
+    # CUSTOMIZE THIS LIST FOR YOUR TABLES
+    tables_to_check = [
+        'analytics_warehouse.hr.employees',
+        'analytics_warehouse.hr.compensation', 
+        'analytics_warehouse.finance.payroll',
+        'analytics_warehouse.org.hierarchy',
+        'processed.turnover.monthly_data',
+        'raw_data.adp.workforce_now',
+        'some_non_existent_table'  # This will fail for testing
+    ]
+    
+    print("🚀 Starting table access verification...")
+    
+    # Run the check
+    results = check_table_access(tables_to_check)
+    
+    # Print summary
+    print_summary(results)
+    
+    print(f"\n🎯 Next Steps:")
+    print("1. Request access for any denied tables")
+    print("2. Verify table names for any 'NOT_FOUND' tables") 
+    print("3. Use accessible tables for your analysis")
+
+# ============================================================================
+# ALTERNATIVE: QUICK ONE-LINER FUNCTIONS
+# ============================================================================
+
+def quick_check(table_name):
+    """Quick single table check"""
     try:
-        # Try to show schemas in this catalog
-        schemas_df = spark.sql(f"SHOW SCHEMAS IN {catalog}")
-        schema_list = [row['databaseName'] for row in schemas_df.collect()]
-        
-        result['Accessible'] = '✅ Yes'
-        result['Schema_Count'] = len(schema_list)
-        result['Sample_Schemas'] = ', '.join(schema_list[:3])
-        
+        record = spark.table(table_name).limit(1).collect()[0]
+        print(f"✅ {table_name}: {dict(record.asDict())}")
+        return True
     except Exception as e:
-        result['Accessible'] = '❌ No'
-        result['Error'] = str(e)[:60]
+        print(f"❌ {table_name}: {str(e)}")
+        return False
+
+def batch_quick_check(table_list):
+    """Quick batch check without detailed output"""
+    print("🔍 QUICK ACCESS CHECK")
+    print("-" * 25)
     
-    alternative_results.append(result)
-
-display(pd.DataFrame(alternative_results))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 8. Sample Data Preview (for accessible tables)
-
-# COMMAND ----------
-
-# Get sample data from first accessible table
-accessible_tables = [r for r in table_test_results if r.get('Access_Status') == '✅ Full Access']
-
-if accessible_tables:
-    # Take first accessible table
-    sample_table = accessible_tables[0]['Full_Name']
+    accessible = []
+    failed = []
     
-    try:
-        # Get sample rows
-        sample_df = spark.sql(f"SELECT * FROM {sample_table} LIMIT 3")
-        display(sample_df)
-        
-        # Get table schema
-        schema_df = spark.sql(f"DESCRIBE TABLE {sample_table}")
-        display(schema_df)
-        
-    except Exception as e:
-        error_msg = [{
-            'Error': 'Sample data retrieval failed',
-            'Table': sample_table,
-            'Message': str(e)
-        }]
-        display(pd.DataFrame(error_msg))
-else:
-    no_sample_msg = [{
-        'Message': 'No accessible tables found for sample data',
-        'Status': '❌ No data access available'
-    }]
-    display(pd.DataFrame(no_sample_msg))
+    for table in table_list:
+        if quick_check(table):
+            accessible.append(table)
+        else:
+            failed.append(table)
+    
+    print(f"\n✅ Accessible ({len(accessible)}): {accessible}")
+    print(f"❌ Failed ({len(failed)}): {failed}")
+    
+    return accessible, failed
 
-# COMMAND ----------
+# ============================================================================
+# USAGE: Uncomment the approach you prefer
+# ============================================================================
 
-# MAGIC %md
-# MAGIC ## 9. Comprehensive Access Summary
+# Approach 1: Detailed check with full output
+# results = check_table_access(your_table_list)
 
-# COMMAND ----------
+# Approach 2: Quick check for fast verification
+# accessible, failed = batch_quick_check(your_table_list)
 
-# Create comprehensive summary
-summary_stats = []
-
-# Schema access summary
-total_schemas = len(schema_results)
-accessible_schemas = len([r for r in schema_results if r['Status'] == '✅ Full Access'])
-schema_success_rate = (accessible_schemas / total_schemas * 100) if total_schemas > 0 else 0
-
-summary_stats.append({
-    'Category': 'Schema Access',
-    'Total_Tested': total_schemas,
-    'Successful': accessible_schemas,
-    'Success_Rate': f"{schema_success_rate:.1f}%",
-    'Status': '✅ Good' if schema_success_rate >= 50 else '❌ Poor'
-})
-
-# Table access summary  
-total_tables = len(table_test_results)
-accessible_tables = len([r for r in table_test_results if r.get('Access_Status') == '✅ Full Access'])
-table_success_rate = (accessible_tables / total_tables * 100) if total_tables > 0 else 0
-
-summary_stats.append({
-    'Category': 'Table Access',
-    'Total_Tested': total_tables,
-    'Successful': accessible_tables, 
-    'Success_Rate': f"{table_success_rate:.1f}%",
-    'Status': '✅ Good' if table_success_rate >= 50 else '❌ Poor'
-})
-
-# Overall data availability
-total_data_sources = accessible_tables
-data_status = 'READY' if total_data_sources >= 5 else 'LIMITED' if total_data_sources >= 1 else 'BLOCKED'
-
-summary_stats.append({
-    'Category': 'Overall Data Access',
-    'Total_Tested': 'N/A',
-    'Successful': total_data_sources,
-    'Success_Rate': data_status,
-    'Status': '✅ Ready' if data_status == 'READY' else '⚠️ Limited' if data_status == 'LIMITED' else '❌ Blocked'
-})
-
-display(pd.DataFrame(summary_stats))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 10. Business Impact Assessment
-
-# COMMAND ----------
-
-# Assess impact on ZENON project timeline
-business_impact = []
-
-# Data availability assessment
-if accessible_tables >= 5:
-    impact_level = "🟢 LOW IMPACT"
-    timeline_status = "On Track"
-    action_needed = "Proceed with data exploration"
-elif accessible_tables >= 1:
-    impact_level = "🟡 MEDIUM IMPACT" 
-    timeline_status = "At Risk"
-    action_needed = "Escalate for additional access, continue with available data"
-else:
-    impact_level = "🔴 HIGH IMPACT"
-    timeline_status = "Blocked"
-    action_needed = "EMERGENCY escalation required"
-
-business_impact.append({
-    'Assessment_Area': 'Data Availability',
-    'Impact_Level': impact_level,
-    'Timeline_Status': timeline_status,
-    'Action_Required': action_needed
-})
-
-# Survival analysis readiness
-survival_ready = accessible_tables >= 3  # Need multiple tables for survival analysis
-survival_status = "Ready" if survival_ready else "Not Ready"
-survival_action = "Begin survival analysis pipeline" if survival_ready else "Need more data sources"
-
-business_impact.append({
-    'Assessment_Area': 'Survival Analysis Readiness',
-    'Impact_Level': '✅ Ready' if survival_ready else '❌ Not Ready',
-    'Timeline_Status': survival_status,
-    'Action_Required': survival_action
-})
-
-display(pd.DataFrame(business_impact))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 11. Escalation Information
-
-# COMMAND ----------
-
-# Create escalation summary
-escalation_info = []
-
-# Critical issues found
-critical_issues = [r for r in schema_results if '❌' in r['Status']]
-permission_errors = [r for r in schema_results if 'Permission Denied' in r['Status']]
-
-escalation_info.append({
-    'Issue_Type': 'Schema Access Failures',
-    'Count': len(critical_issues),
-    'Severity': 'High' if len(critical_issues) > len(schema_results)/2 else 'Medium',
-    'Escalation_Needed': 'Yes' if len(critical_issues) > 0 else 'No'
-})
-
-escalation_info.append({
-    'Issue_Type': 'Permission Denied Errors',
-    'Count': len(permission_errors),
-    'Severity': 'Critical' if len(permission_errors) > 0 else 'None',
-    'Escalation_Needed': 'Immediate' if len(permission_errors) > 0 else 'No'
-})
-
-display(pd.DataFrame(escalation_info))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 12. Export Results Summary
-
-# COMMAND ----------
-
-# Create final results for team sharing
-final_results = {
-    'test_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    'total_schemas_tested': len(schema_results),
-    'accessible_schemas': len([r for r in schema_results if r['Status'] == '✅ Full Access']),
-    'total_tables_tested': len(table_test_results),
-    'accessible_tables': len([r for r in table_test_results if r.get('Access_Status') == '✅ Full Access']),
-    'critical_issues': len([r for r in schema_results if '❌' in r['Status']]),
-    'overall_status': data_status,
-    'escalation_required': len(permission_errors) > 0
-}
-
-# Convert to display format
-final_summary = []
-for key, value in final_results.items():
-    final_summary.append({
-        'Metric': key.replace('_', ' ').title(),
-        'Value': str(value),
-        'For_Standup': f"{key}: {value}"
-    })
-
-display(pd.DataFrame(final_summary))
-
-# COMMAND ----------
-
-# Test completion message
-completion_msg = [{
-    'Status': 'TEST COMPLETED',
-    'Total_Cells_Run': '12 cells completed successfully',
-    'Results_Available': 'All results displayed above',
-    'Next_Action': 'Review Section 9 (Summary) and Section 11 (Escalation) for key findings',
-    'Escalation_Status': 'REQUIRED' if final_results['escalation_required'] else 'Optional'
-}]
-
-display(pd.DataFrame(completion_msg))
+# Approach 3: Single table check
+# quick_check('your_table_name')
