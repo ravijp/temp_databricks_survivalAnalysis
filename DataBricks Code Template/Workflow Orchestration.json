@@ -1,0 +1,351 @@
+{
+  "name": "monthly_hr_survival_analysis_pipeline",
+  "description": "Complete monthly pipeline for HR survival analysis - data processing, model training, and employee scoring",
+  "tags": {
+    "team": "hr-analytics",
+    "schedule": "monthly_25th",
+    "business_impact": "high",
+    "complexity": "simple"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "data_processing_cluster",
+      "new_cluster": {
+        "cluster_name": "",
+        "spark_version": "13.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "driver_node_type_id": "i3.xlarge",
+        "num_workers": 2,
+        "spark_conf": {
+          "spark.databricks.delta.preview.enabled": "true",
+          "spark.sql.adaptive.enabled": "true",
+          "spark.sql.adaptive.coalescePartitions.enabled": "true",
+          "spark.databricks.delta.retentionDurationCheck.enabled": "false"
+        },
+        "custom_tags": {
+          "purpose": "hr-survival-analysis",
+          "cost_center": "hr-analytics",
+          "auto_terminate": "true"
+        },
+        "enable_elastic_disk": true,
+        "data_security_mode": "SINGLE_USER",
+        "runtime_engine": "STANDARD",
+        "autotermination_minutes": 60
+      }
+    },
+    {
+      "job_cluster_key": "ml_training_cluster",
+      "new_cluster": {
+        "cluster_name": "",
+        "spark_version": "13.3.x-scala2.12", 
+        "node_type_id": "i3.2xlarge",
+        "driver_node_type_id": "i3.2xlarge",
+        "num_workers": 2,
+        "spark_conf": {
+          "spark.databricks.delta.preview.enabled": "true",
+          "spark.sql.adaptive.enabled": "true"
+        },
+        "custom_tags": {
+          "purpose": "ml-training",
+          "cost_center": "hr-analytics"
+        },
+        "enable_elastic_disk": true,
+        "data_security_mode": "SINGLE_USER",
+        "runtime_engine": "STANDARD",
+        "autotermination_minutes": 30
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "data_discovery_validation",
+      "description": "Validate data sources and discover any new tables",
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/01_data_discovery_profiling",
+        "base_parameters": {
+          "validate_existing_tables": "true",
+          "discovery_mode": "validation_only",
+          "alert_on_schema_changes": "true"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["data-team@company.com"]
+      }
+    },
+    {
+      "task_key": "complex_data_processing",
+      "description": "Process multiple HR tables into survival analysis dataset",
+      "depends_on": [
+        {
+          "task_key": "data_discovery_validation"
+        }
+      ],
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/02_complex_data_processing",
+        "base_parameters": {
+          "force_full_refresh": "false",
+          "data_quality_threshold": "0.8",
+          "min_records_required": "1000"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 2,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["data-team@company.com", "hr-analytics@company.com"]
+      }
+    },
+    {
+      "task_key": "data_quality_gate",
+      "description": "Critical data quality validation gate",
+      "depends_on": [
+        {
+          "task_key": "complex_data_processing",
+          "outcome": "success"
+        }
+      ],
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/03_data_quality_gate",
+        "base_parameters": {
+          "min_events": "100",
+          "max_event_rate": "0.5",
+          "min_event_rate": "0.05",
+          "fail_on_quality_issues": "true"
+        }
+      },
+      "timeout_seconds": 900,
+      "max_retries": 0,
+      "email_notifications": {
+        "on_failure": ["data-team@company.com", "hr-analytics@company.com"]
+      }
+    },
+    {
+      "task_key": "model_training",
+      "description": "Train XGBoost AFT survival model with OOS/OOT validation",
+      "depends_on": [
+        {
+          "task_key": "data_quality_gate",
+          "outcome": "success"
+        }
+      ],
+      "job_cluster_key": "ml_training_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/04_xgboost_aft_training",
+        "base_parameters": {
+          "min_concordance_threshold": "0.7",
+          "enable_hyperparameter_tuning": "false",
+          "auto_promote_to_production": "true"
+        }
+      },
+      "timeout_seconds": 7200,
+      "max_retries": 1,
+      "retry_on_timeout": false,
+      "libraries": [
+        {
+          "pypi": {
+            "package": "xgboost==1.7.6"
+          }
+        },
+        {
+          "pypi": {
+            "package": "lifelines==0.27.7"
+          }
+        },
+        {
+          "pypi": {
+            "package": "hyperopt==0.2.7"
+          }
+        },
+        {
+          "pypi": {
+            "package": "scikit-learn==1.3.0"
+          }
+        }
+      ],
+      "email_notifications": {
+        "on_failure": ["ml-team@company.com", "hr-analytics@company.com"]
+      }
+    },
+    {
+      "task_key": "model_validation_gate",
+      "description": "Validate model performance before proceeding to scoring",
+      "depends_on": [
+        {
+          "task_key": "model_training"
+        }
+      ],
+      "job_cluster_key": "ml_training_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/05_model_validation_gate",
+        "base_parameters": {
+          "min_concordance_threshold": "0.7",
+          "model_name": "employee_survival_xgboost_aft",
+          "model_stage": "Production"
+        }
+      },
+      "timeout_seconds": 900,
+      "max_retries": 0,
+      "email_notifications": {
+        "on_failure": ["ml-team@company.com", "hr-analytics@company.com"]
+      }
+    },
+    {
+      "task_key": "batch_scoring",
+      "description": "Score all active employees with survival model",
+      "depends_on": [
+        {
+          "task_key": "model_validation_gate",
+          "outcome": "success"
+        }
+      ],
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/06_batch_scoring",
+        "base_parameters": {
+          "model_stage": "Production",
+          "enable_alerts": "true",
+          "max_high_risk_percentage": "0.20"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 2,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["ml-team@company.com", "hr-analytics@company.com"]
+      }
+    },
+    {
+      "task_key": "business_reporting",
+      "description": "Generate business reports and client deliverables",
+      "depends_on": [
+        {
+          "task_key": "batch_scoring"
+        }
+      ],
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/07_business_reporting",
+        "base_parameters": {
+          "generate_executive_summary": "true",
+          "include_trend_analysis": "true",
+          "export_to_csv": "true"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "email_notifications": {
+        "on_failure": ["hr-analytics@company.com"]
+      }
+    },
+    {
+      "task_key": "pipeline_cleanup",
+      "description": "Clean up temporary files and optimize tables",
+      "depends_on": [
+        {
+          "task_key": "business_reporting"
+        }
+      ],
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/08_pipeline_cleanup",
+        "base_parameters": {
+          "optimize_delta_tables": "true",
+          "cleanup_temp_files": "true",
+          "retention_days": "90"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "email_notifications": {
+        "on_failure": ["data-team@company.com"]
+      }
+    },
+    {
+      "task_key": "success_notification",
+      "description": "Send success notification with pipeline summary",
+      "depends_on": [
+        {
+          "task_key": "pipeline_cleanup"
+        }
+      ],
+      "job_cluster_key": "data_processing_cluster",
+      "notebook_task": {
+        "notebook_path": "/Shared/hr_survival_pipeline/09_success_notification",
+        "base_parameters": {
+          "notification_type": "success",
+          "include_metrics": "true",
+          "send_to_clients": "true"
+        }
+      },
+      "timeout_seconds": 600,
+      "max_retries": 1
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 8 25 * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "email_notifications": {
+    "on_start": ["hr-analytics@company.com"],
+    "on_success": ["hr-analytics@company.com", "hr-leadership@company.com"],
+    "on_failure": ["ml-team@company.com", "data-team@company.com", "hr-analytics@company.com"],
+    "no_alert_for_skipped_runs": false
+  },
+  "webhook_notifications": {
+    "on_success": [
+      {
+        "id": "teams-success-webhook",
+        "url": "https://outlook.office.com/webhook/your-teams-webhook-url"
+      }
+    ],
+    "on_failure": [
+      {
+        "id": "teams-failure-webhook", 
+        "url": "https://outlook.office.com/webhook/your-teams-webhook-url"
+      }
+    ]
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 21600,
+  "health": {
+    "rules": [
+      {
+        "metric": "RUN_DURATION_SECONDS",
+        "op": "GREATER_THAN",
+        "value": 14400
+      }
+    ]
+  },
+  "notification_settings": {
+    "no_alert_for_canceled_runs": false,
+    "no_alert_for_skipped_runs": false
+  },
+  "run_as": {
+    "user_name": "hr-analytics-service@company.com"
+  },
+  "access_control_list": [
+    {
+      "user_name": "hr-analytics-service@company.com",
+      "permission_level": "CAN_MANAGE"
+    },
+    {
+      "group_name": "hr-analytics-team",
+      "permission_level": "CAN_MANAGE"
+    },
+    {
+      "group_name": "data-engineering-team",
+      "permission_level": "CAN_VIEW"
+    },
+    {
+      "group_name": "ml-engineering-team",
+      "permission_level": "CAN_VIEW"
+    }
+  ]
+}
