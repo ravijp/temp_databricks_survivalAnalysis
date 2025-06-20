@@ -1,6 +1,6 @@
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, count, when, desc, lit, isnan, isnull, approx_count_distinct
-from pyspark.sql.types import DoubleType, StringType
+from pyspark.sql.types import *
 import pandas as pd
 import os
 import time
@@ -10,7 +10,7 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
                 filter_condition: Optional[str] = None, 
                 sample_threshold: int = 50_000_000) -> str:
     """
-    Fast EDD generation with corrected logic
+    Fast EDD generation using pure schema-based type detection
     """
     
     print(f"Processing: {table_name}")
@@ -34,27 +34,26 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     columns = df.columns
     print(f"Analyzing {total_rows:,} rows, {len(columns)} columns")
     
-    # Batch operations for basic statistics (FAST)
+    # Schema-based type detection (INSTANT)
+    print("Detecting column types from schema...")
+    numeric_columns, categorical_columns = _classify_columns_by_schema(df)
+    print(f"Numeric: {len(numeric_columns)}, Categorical: {len(categorical_columns)}")
+    
+    # Batch operations for basic statistics
     print("Computing basic statistics...")
     
-    # Batch null counts
-    null_exprs = [count(when(col(c).isNull() | (col(c) == ""), c)).alias(f"null_{c}") for c in columns]
+    # Batch null counts for all columns
+    null_exprs = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
     null_counts = df.select(null_exprs).collect()[0].asDict()
     
-    # Batch unique counts  
+    # Batch unique counts for all columns
     unique_exprs = [approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns]
     unique_counts = df.select(unique_exprs).collect()[0].asDict()
     
-    # Quick type detection - test numeric conversion without collecting data
-    print("Detecting column types...")
-    numeric_columns, categorical_columns = _detect_column_types(df, columns)
-    
-    print(f"Numeric: {len(numeric_columns)}, Categorical: {len(categorical_columns)}")
-    
-    # Batch numeric statistics (FAST)
+    # Batch numeric statistics
     numeric_stats = {}
     if numeric_columns:
-        print("Computing numeric statistics...")
+        print(f"Computing numeric statistics for {len(numeric_columns)} columns...")
         numeric_stats = _get_batch_numeric_stats(df, numeric_columns)
     
     # Process results
@@ -67,11 +66,9 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         non_null_count = total_rows - null_count
         
         if column_name in numeric_columns:
-            # Numeric column
             result = _build_numeric_result(i, column_name, null_count, non_null_count, 
                                          unique_count, numeric_stats.get(column_name, {}))
         else:
-            # Categorical column - only collect data for categorical processing
             result = _build_categorical_result(df, i, column_name, null_count, 
                                              non_null_count, unique_count)
         
@@ -92,55 +89,54 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     
     return filepath
 
-def _detect_column_types(df, columns: List[str]) -> tuple[List[str], List[str]]:
-    """Fast column type detection using Spark operations"""
+def _classify_columns_by_schema(df) -> tuple[List[str], List[str]]:
+    """
+    Classify columns as numeric or categorical based on Spark schema
+    Fast schema-based approach - no data scanning required
+    """
+    
+    numeric_types = {
+        IntegerType, LongType, FloatType, DoubleType, 
+        DecimalType, ByteType, ShortType
+    }
     
     numeric_columns = []
     categorical_columns = []
     
-    for column_name in columns:
-        try:
-            # Quick test: try to cast and count nulls after conversion
-            original_nulls = df.filter(col(column_name).isNull() | (col(column_name) == "")).count()
-            
-            # Cast to double and count new nulls
-            casted_nulls = df.select(col(column_name).cast(DoubleType()).alias("test")).filter(col("test").isNull()).count()
-            
-            # If new nulls appeared after casting, it means non-numeric data exists
-            if casted_nulls > original_nulls:
-                categorical_columns.append(column_name)
-            else:
-                numeric_columns.append(column_name)
-                
-        except Exception:
-            # Any error means categorical
+    for field in df.schema.fields:
+        column_name = field.name
+        column_type = type(field.dataType)
+        
+        if column_type in numeric_types:
+            numeric_columns.append(column_name)
+        else:
+            # Everything else is categorical: String, Boolean, Date, Timestamp, Arrays, etc.
             categorical_columns.append(column_name)
     
     return numeric_columns, categorical_columns
 
 def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
-    """Get numeric statistics for all numeric columns in batch"""
+    """Get numeric statistics for all numeric columns efficiently"""
     
     if not numeric_columns:
         return {}
     
     # Use Spark's built-in describe for basic stats
-    numeric_df = df.select([col(c).cast(DoubleType()).alias(c) for c in numeric_columns])
-    stats_df = numeric_df.describe()
+    stats_df = df.select(numeric_columns).describe()
     stats_pandas = stats_df.toPandas().set_index('summary')
     
-    # Get percentiles for all numeric columns in batch
+    # Get percentiles for all numeric columns
     percentile_stats = {}
     percentile_values = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]
     
     for column_name in numeric_columns:
         try:
-            percentiles = numeric_df.select(column_name).na.drop().approxQuantile(column_name, percentile_values, 0.01)
+            percentiles = df.select(column_name).na.drop().approxQuantile(column_name, percentile_values, 0.01)
             percentile_stats[column_name] = percentiles
         except:
             percentile_stats[column_name] = [None] * 7
     
-    # Combine stats
+    # Combine all statistics
     combined_stats = {}
     for column_name in numeric_columns:
         try:
@@ -157,7 +153,7 @@ def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
     return combined_stats
 
 def _safe_float(value) -> Optional[float]:
-    """Safely convert to float, handling inf and nan"""
+    """Safely convert to float, handling inf and nan values"""
     try:
         f_val = float(value)
         if f_val == float('inf') or f_val == float('-inf') or f_val != f_val:  # NaN check
@@ -168,7 +164,7 @@ def _safe_float(value) -> Optional[float]:
 
 def _build_numeric_result(field_num: int, column_name: str, null_count: int, 
                          non_null_count: int, unique_count: int, stats: Dict) -> Dict:
-    """Build numeric column result"""
+    """Build numeric column result with proper error handling"""
     
     if 'error' in stats or not stats:
         return {
@@ -215,16 +211,18 @@ def _build_numeric_result(field_num: int, column_name: str, null_count: int,
 
 def _build_categorical_result(df, field_num: int, column_name: str, null_count: int, 
                             non_null_count: int, unique_count: int) -> Dict:
-    """Build categorical column result with correct top/bottom logic"""
+    """
+    Build categorical column result with proper TOP 5 and BOTTOM 5 value counts
+    """
     
-    # Handle special cases first
+    # Handle special cases
     if unique_count == 0:
         default_val = 'No_Data'
     elif unique_count == 1:
         # Get the single value
         try:
-            single_row = df.select(column_name).filter((col(column_name).isNotNull()) & (col(column_name) != "")).first()
-            if single_row:
+            single_row = df.select(column_name).filter(col(column_name).isNotNull()).first()
+            if single_row and single_row[0] is not None:
                 default_val = f"{single_row[0]}:{non_null_count}"
             else:
                 default_val = 'All_Same'
@@ -233,25 +231,32 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
     elif unique_count == non_null_count:
         default_val = 'All_Unique'
     else:
-        # Get value frequencies - collect more data to properly identify top AND bottom
+        # Get frequency distribution for top/bottom analysis
         try:
-            # Limit to reasonable size for performance
-            limit_size = min(500, unique_count) if unique_count > 100 else unique_count
+            # Get enough data to properly identify top AND bottom values
+            # For large cardinality, get reasonable sample to find frequency extremes
+            limit_size = min(1000, max(100, unique_count))
             
             value_counts = (df.select(column_name)
-                          .filter((col(column_name).isNotNull()) & (col(column_name) != ""))
+                          .filter(col(column_name).isNotNull())
                           .groupBy(column_name)
                           .count()
-                          .orderBy(desc("count"), col(column_name))
+                          .orderBy(desc("count"), col(column_name))  # Secondary sort for consistency
                           .limit(limit_size)
                           .collect())
             
-            if value_counts:
+            if not value_counts:
+                default_val = 'No_Data'
+            else:
                 # Format as value:count
                 formatted_values = [f"{row[column_name]}:{row['count']}" for row in value_counts]
                 
-                # Get top 5 and bottom 5 (following original EDD logic)
+                # Implement proper TOP 5 and BOTTOM 5 logic
                 if len(formatted_values) >= 10:
+                    # We have enough data for proper top/bottom split
+                    top_5 = formatted_values[:5]      # Most frequent (highest counts)
+                    bottom_5 = formatted_values[-5:]  # Least frequent (lowest counts)
+                    
                     return {
                         'Field_Num': field_num,
                         'Field_Name': column_name,
@@ -260,20 +265,23 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
                         'Num_Entries': non_null_count,
                         'Num_Unique': unique_count,
                         'Stddev': None,
-                        'Mean_or_Top1': formatted_values[0],  # Top 1
-                        'Min_or_Top2': formatted_values[1],   # Top 2
-                        'P1_or_Top3': formatted_values[2],    # Top 3
-                        'P5_or_Top4': formatted_values[3],    # Top 4
-                        'P25_or_Top5': formatted_values[4],   # Top 5
-                        'Median_or_Bot5': formatted_values[-5],  # Bottom 5
-                        'P75_or_Bot4': formatted_values[-4],     # Bottom 4
-                        'P95_or_Bot3': formatted_values[-3],     # Bottom 3
-                        'P99_or_Bot2': formatted_values[-2],     # Bottom 2
-                        'Max_or_Bot1': formatted_values[-1]      # Bottom 1
+                        # TOP 5 - Most frequent values
+                        'Mean_or_Top1': top_5[0],
+                        'Min_or_Top2': top_5[1],
+                        'P1_or_Top3': top_5[2],
+                        'P5_or_Top4': top_5[3],
+                        'P25_or_Top5': top_5[4],
+                        # BOTTOM 5 - Least frequent values  
+                        'Median_or_Bot5': bottom_5[0],  # 5th from bottom
+                        'P75_or_Bot4': bottom_5[1],     # 4th from bottom
+                        'P95_or_Bot3': bottom_5[2],     # 3rd from bottom
+                        'P99_or_Bot2': bottom_5[3],     # 2nd from bottom
+                        'Max_or_Bot1': bottom_5[4]      # 1st from bottom (least frequent)
                     }
                 else:
-                    # Less than 10 unique values - just use sequentially
-                    padded_values = formatted_values + [''] * (10 - len(formatted_values))
+                    # Less than 10 unique values - fill sequentially with padding
+                    padded_values = formatted_values + [''] * max(0, 10 - len(formatted_values))
+                    
                     return {
                         'Field_Num': field_num,
                         'Field_Name': column_name,
@@ -293,10 +301,12 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
                         'P99_or_Bot2': padded_values[8],
                         'Max_or_Bot1': padded_values[9]
                     }
+                    
         except Exception as e:
+            print(f"Error processing categorical column {column_name}: {e}")
             default_val = 'High_Cardinality'
     
-    # For special cases, return same value across all fields
+    # For special cases, use same value across all fields
     return {
         'Field_Num': field_num,
         'Field_Name': column_name,
@@ -368,9 +378,9 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
     
     return results
 
-# Helper functions
+# Helper functions for file management
 def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
-    """List all EDD files"""
+    """List all EDD files in the output directory"""
     try:
         if os.path.exists(output_path):
             files = [f for f in os.listdir(output_path) if f.endswith('.csv')]
@@ -389,7 +399,7 @@ def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error: {e}")
 
 def display_edd_file(filepath: str, num_rows: int = 20) -> None:
-    """Display EDD file in notebook"""
+    """Display EDD file contents in notebook"""
     try:
         df = pd.read_csv(filepath)
         print(f"EDD File: {os.path.basename(filepath)}")
@@ -407,9 +417,28 @@ def display_edd_file(filepath: str, num_rows: int = 20) -> None:
     except Exception as e:
         print(f"Error: {e}")
 
+def show_schema_classification(table_name: str) -> None:
+    """Helper function to preview schema-based classification"""
+    df = spark.table(table_name)
+    numeric_cols, categorical_cols = _classify_columns_by_schema(df)
+    
+    print(f"Schema classification for: {table_name}")
+    print(f"Total columns: {len(df.columns)}")
+    print("-" * 50)
+    print(f"NUMERIC ({len(numeric_cols)}):")
+    for col_name in numeric_cols:
+        col_type = dict(df.dtypes)[col_name]
+        print(f"  {col_name} ({col_type})")
+    
+    print(f"\nCATEGORICAL ({len(categorical_cols)}):")
+    for col_name in categorical_cols:
+        col_type = dict(df.dtypes)[col_name]
+        print(f"  {col_name} ({col_type})")
+
 if __name__ == "__main__":
-    print("Fast EDD system ready:")
+    print("Fast Schema-based EDD system ready:")
     print("- generate_edd(table_name)")  
     print("- batch_edd(table_list)")
     print("- list_edd_files()")
     print("- display_edd_file(filepath)")
+    print("- show_schema_classification(table_name) - preview type detection")
