@@ -1,12 +1,11 @@
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
+from pyspark.sql.functions import col as spark_col, count as spark_count, when, desc, approx_count_distinct
 import pandas as pd
 import os
 import time
 
-def generate_edd_fast(table_name, output_path="/dbfs/FileStore/edd", filter_condition=None, sample_rate=None):
+def generate_edd_fast(table_name, output_path="/tmp/edd", filter_condition=None, sample_rate=None):
     """
-    Fast EDD generation using batch operations - 10x faster than column-by-column processing
+    Fast EDD generation using batch operations
     
     Parameters:
     table_name: Name of the table to analyze
@@ -29,171 +28,225 @@ def generate_edd_fast(table_name, output_path="/dbfs/FileStore/edd", filter_cond
         df = df.sample(sample_rate, seed=42)
         print(f"Using {sample_rate*100}% sample")
     
-    # CRITICAL: Cache the dataframe to avoid re-reading for each operation
+    # Cache the dataframe
     df.cache()
     
     total_rows = df.count()
     print(f"Analyzing {total_rows:,} rows")
     
-    columns = df.columns
-    print(f"Processing {len(columns)} columns using batch operations...")
+    column_names = df.columns
+    print(f"Processing {len(column_names)} columns using batch operations...")
     
-    # Step 1: Get all column types at once
+    # Step 1: Get column types
     column_types = dict(df.dtypes)
-    numeric_cols = [col for col, dtype in column_types.items() 
-                   if dtype in ['int', 'bigint', 'float', 'double', 'decimal']]
-    categorical_cols = [col for col in columns if col not in numeric_cols]
+    numeric_columns = [column_name for column_name, dtype in column_types.items() 
+                      if dtype in ['int', 'bigint', 'float', 'double', 'decimal']]
+    categorical_columns = [column_name for column_name in column_names if column_name not in numeric_columns]
     
-    print(f"Numeric columns: {len(numeric_cols)}, Categorical columns: {len(categorical_cols)}")
+    print(f"Numeric columns: {len(numeric_columns)}, Categorical columns: {len(categorical_columns)}")
     
     # Step 2: Batch compute null counts for ALL columns at once
     print("Computing null counts for all columns...")
-    null_counts_expr = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
-    null_results = df.select(null_counts_expr).collect()[0]
-    null_counts = {col: null_results[f"null_{col}"] for col in columns}
+    null_count_expressions = [spark_count(when(spark_col(column_name).isNull(), column_name)).alias(f"null_{column_name}") 
+                             for column_name in column_names]
+    null_results_row = df.select(null_count_expressions).collect()[0]
+    null_counts_dict = {column_name: null_results_row[f"null_{column_name}"] for column_name in column_names}
     
-    # Step 3: Batch compute unique counts for ALL columns at once (approximate for speed)
+    # Step 3: Batch compute unique counts for ALL columns at once
     print("Computing unique counts for all columns...")
-    unique_counts = {}
-    for col in columns:
-        try:
-            # Use approxCountDistinct for speed on large datasets
-            unique_count = df.select(approx_count_distinct(col)).collect()[0][0]
-            unique_counts[col] = unique_count
-        except:
-            unique_counts[col] = 0
+    unique_count_expressions = [approx_count_distinct(spark_col(column_name)).alias(column_name) 
+                               for column_name in column_names]
+    unique_results_row = df.select(unique_count_expressions).collect()[0]
+    unique_counts_dict = {column_name: unique_results_row[column_name] for column_name in column_names}
     
-    # Step 4: Batch process ALL numeric columns at once
-    numeric_stats = {}
-    if numeric_cols:
-        print(f"Computing statistics for {len(numeric_cols)} numeric columns...")
+    # Step 4: Process numeric columns
+    numeric_statistics = {}
+    if numeric_columns:
+        print(f"Computing statistics for {len(numeric_columns)} numeric columns...")
         
         # Get basic stats for all numeric columns in one operation
-        stats_df = df.select(numeric_cols).describe()
-        stats_pandas = stats_df.toPandas().set_index('summary')
+        stats_df = df.select(numeric_columns).describe()
+        stats_pandas_df = stats_df.toPandas().set_index('summary')
         
-        # Get percentiles for all numeric columns in one operation
+        # Get percentiles for numeric columns
         print("Computing percentiles for numeric columns...")
         percentile_values = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]
         
-        for col in numeric_cols:
+        for column_name in numeric_columns:
             try:
                 # Extract basic stats
-                col_stats = {
-                    'mean': float(stats_pandas.loc['mean', col]),
-                    'stddev': float(stats_pandas.loc['stddev', col]),
-                    'min': float(stats_pandas.loc['min', col]),
-                    'max': float(stats_pandas.loc['max', col])
+                basic_stats = {
+                    'mean': float(stats_pandas_df.loc['mean', column_name]),
+                    'stddev': float(stats_pandas_df.loc['stddev', column_name]),
+                    'min': float(stats_pandas_df.loc['min', column_name]),
+                    'max': float(stats_pandas_df.loc['max', column_name])
                 }
                 
-                # Get percentiles (this is the slow part, but we can't avoid it)
-                percentiles = df.select(col).na.drop().approxQuantile(col, percentile_values, 0.05)
+                # Get percentiles
+                percentiles_list = df.select(column_name).na.drop().approxQuantile(column_name, percentile_values, 0.05)
                 
-                numeric_stats[col] = {
-                    **col_stats,
-                    'percentiles': percentiles
+                numeric_statistics[column_name] = {
+                    **basic_stats,
+                    'percentiles': percentiles_list
                 }
-            except Exception as e:
-                numeric_stats[col] = {'error': str(e)}
+            except Exception as error:
+                numeric_statistics[column_name] = {'error': str(error)}
     
-    # Step 5: Process categorical columns (top values)
-    categorical_stats = {}
-    if categorical_cols:
-        print(f"Computing top values for {len(categorical_cols)} categorical columns...")
+    # Step 5: Process categorical columns
+    categorical_statistics = {}
+    if categorical_columns:
+        print(f"Computing top values for {len(categorical_columns)} categorical columns...")
         
-        for col in categorical_cols:
+        for column_name in categorical_columns:
             try:
-                # Only get top values for reasonable cardinality
-                if unique_counts[col] <= 1000:
-                    top_values = (df.select(col)
-                                .na.drop()
-                                .groupBy(col)
-                                .count()
-                                .orderBy(desc("count"))
-                                .limit(5)
-                                .collect())
-                    
-                    categorical_stats[col] = {
-                        'top_values': [(row[col], row['count']) for row in top_values]
-                    }
-                else:
-                    categorical_stats[col] = {'note': 'High_Cardinality'}
-            except Exception as e:
-                categorical_stats[col] = {'error': str(e)}
-    
-    # Step 6: Combine results into final format
-    print("Combining results...")
-    results = []
-    
-    for i, col_name in enumerate(columns, 1):
-        non_null_count = total_rows - null_counts[col_name]
-        
-        if col_name in numeric_cols:
-            # Numeric column result
-            if col_name in numeric_stats and 'error' not in numeric_stats[col_name]:
-                stats = numeric_stats[col_name]
-                percentiles = stats.get('percentiles', [])
+                # Get top 10 values for categorical columns
+                top_values_list = (df.select(column_name)
+                                 .filter(spark_col(column_name).isNotNull())
+                                 .groupBy(column_name)
+                                 .count()
+                                 .orderBy(desc("count"))
+                                 .limit(10)
+                                 .collect())
                 
-                result = {
-                    'Field_Num': i,
-                    'Field_Name': col_name,
+                categorical_statistics[column_name] = [(row[column_name], row['count']) for row in top_values_list]
+            except Exception as error:
+                categorical_statistics[column_name] = []
+    
+    # Step 6: Build results in EDD format
+    print("Building results...")
+    edd_results = []
+    
+    for field_index, column_name in enumerate(column_names, 1):
+        non_null_count = total_rows - null_counts_dict[column_name]
+        unique_count = unique_counts_dict[column_name]
+        
+        if column_name in numeric_columns:
+            # Numeric column result - matching original EDD format
+            if column_name in numeric_statistics and 'error' not in numeric_statistics[column_name]:
+                stats = numeric_statistics[column_name]
+                percentiles_list = stats.get('percentiles', [])
+                
+                edd_result = {
+                    'Field_Num': field_index,
+                    'Field_Name': column_name,
                     'Type': 'Numeric',
-                    'Num_Blanks': null_counts[col_name],
+                    'Num_Blanks': null_counts_dict[column_name],
                     'Num_Entries': non_null_count,
-                    'Num_Unique': unique_counts[col_name],
-                    'Mean': round(stats['mean'], 4),
-                    'Stddev': round(stats['stddev'], 4),
-                    'Min': stats['min'],
-                    'P1': percentiles[0] if len(percentiles) > 0 else None,
-                    'P5': percentiles[1] if len(percentiles) > 1 else None,
-                    'P25': percentiles[2] if len(percentiles) > 2 else None,
-                    'Median': percentiles[3] if len(percentiles) > 3 else None,
-                    'P75': percentiles[4] if len(percentiles) > 4 else None,
-                    'P95': percentiles[5] if len(percentiles) > 5 else None,
-                    'P99': percentiles[6] if len(percentiles) > 6 else None,
-                    'Max': stats['max']
+                    'Num_Unique': unique_count,
+                    'Stddev': round(stats['stddev'], 6),
+                    'Mean_or_Top1': round(stats['mean'], 6),
+                    'Min_or_Top2': stats['min'],
+                    'P1_or_Top3': percentiles_list[0] if len(percentiles_list) > 0 else None,
+                    'P5_or_Top4': percentiles_list[1] if len(percentiles_list) > 1 else None,
+                    'P25_or_Top5': percentiles_list[2] if len(percentiles_list) > 2 else None,
+                    'Median_or_Bot5': percentiles_list[3] if len(percentiles_list) > 3 else None,
+                    'P75_or_Bot4': percentiles_list[4] if len(percentiles_list) > 4 else None,
+                    'P95_or_Bot3': percentiles_list[5] if len(percentiles_list) > 5 else None,
+                    'P99_or_Bot2': percentiles_list[6] if len(percentiles_list) > 6 else None,
+                    'Max_or_Bot1': stats['max']
                 }
             else:
-                result = {
-                    'Field_Num': i,
-                    'Field_Name': col_name,
+                # Numeric column with error
+                edd_result = {
+                    'Field_Num': field_index,
+                    'Field_Name': column_name,
                     'Type': 'Numeric',
-                    'Num_Blanks': null_counts[col_name],
+                    'Num_Blanks': null_counts_dict[column_name],
                     'Num_Entries': non_null_count,
-                    'Num_Unique': unique_counts[col_name],
-                    'Note': 'Stats_Error'
+                    'Num_Unique': unique_count,
+                    'Stddev': None,
+                    'Mean_or_Top1': 'Error',
+                    'Min_or_Top2': None,
+                    'P1_or_Top3': None,
+                    'P5_or_Top4': None,
+                    'P25_or_Top5': None,
+                    'Median_or_Bot5': None,
+                    'P75_or_Bot4': None,
+                    'P95_or_Bot3': None,
+                    'P99_or_Bot2': None,
+                    'Max_or_Bot1': None
                 }
         else:
-            # Categorical column result
-            result = {
-                'Field_Num': i,
-                'Field_Name': col_name,
+            # Categorical column result - matching original EDD format
+            edd_result = {
+                'Field_Num': field_index,
+                'Field_Name': column_name,
                 'Type': 'Categorical',
-                'Num_Blanks': null_counts[col_name],
+                'Num_Blanks': null_counts_dict[column_name],
                 'Num_Entries': non_null_count,
-                'Num_Unique': unique_counts[col_name]
+                'Num_Unique': unique_count,
+                'Stddev': None
             }
             
-            if col_name in categorical_stats:
-                if 'top_values' in categorical_stats[col_name]:
-                    top_values = categorical_stats[col_name]['top_values']
-                    for j, (value, count) in enumerate(top_values):
-                        result[f'Top_{j+1}'] = f"{value}:{count}"
+            # Add top values in EDD format
+            if column_name in categorical_statistics and len(categorical_statistics[column_name]) > 0:
+                top_values_list = categorical_statistics[column_name]
+                
+                # Create 17 positions for categorical values (like original EDD)
+                categorical_values = []
+                for value, count in top_values_list:
+                    categorical_values.append(f"{value}:{count}")
+                
+                # Pad to ensure we have enough values
+                while len(categorical_values) < 17:
+                    categorical_values.append('')
+                
+                # Map to EDD column names
+                edd_result.update({
+                    'Mean_or_Top1': categorical_values[0] if len(categorical_values) > 0 else '',
+                    'Min_or_Top2': categorical_values[1] if len(categorical_values) > 1 else '',
+                    'P1_or_Top3': categorical_values[2] if len(categorical_values) > 2 else '',
+                    'P5_or_Top4': categorical_values[3] if len(categorical_values) > 3 else '',
+                    'P25_or_Top5': categorical_values[4] if len(categorical_values) > 4 else '',
+                    'Median_or_Bot5': categorical_values[12] if len(categorical_values) > 12 else '',
+                    'P75_or_Bot4': categorical_values[13] if len(categorical_values) > 13 else '',
+                    'P95_or_Bot3': categorical_values[14] if len(categorical_values) > 14 else '',
+                    'P99_or_Bot2': categorical_values[15] if len(categorical_values) > 15 else '',
+                    'Max_or_Bot1': categorical_values[16] if len(categorical_values) > 16 else ''
+                })
+            else:
+                # No data or high cardinality
+                if unique_count == 0:
+                    default_value = 'No_Data'
+                elif unique_count == 1:
+                    default_value = 'All_Same'
+                elif unique_count == non_null_count:
+                    default_value = 'All_Unique'
                 else:
-                    result['Note'] = categorical_stats[col_name].get('note', 'No_Data')
+                    default_value = 'High_Cardinality'
+                
+                edd_result.update({
+                    'Mean_or_Top1': default_value,
+                    'Min_or_Top2': default_value,
+                    'P1_or_Top3': default_value,
+                    'P5_or_Top4': default_value,
+                    'P25_or_Top5': default_value,
+                    'Median_or_Bot5': default_value,
+                    'P75_or_Bot4': default_value,
+                    'P95_or_Bot3': default_value,
+                    'P99_or_Bot2': default_value,
+                    'Max_or_Bot1': default_value
+                })
         
-        results.append(result)
+        edd_results.append(edd_result)
     
     # Unpersist cache
     df.unpersist()
     
     # Save results
-    os.makedirs(output_path, exist_ok=True)
+    try:
+        os.makedirs(output_path, exist_ok=True)
+    except:
+        output_path = "/tmp/edd"
+        os.makedirs(output_path, exist_ok=True)
+    
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
     filepath = os.path.join(output_path, filename)
     
-    pd.DataFrame(results).to_csv(filepath, index=False)
+    # Create DataFrame and save
+    edd_dataframe = pd.DataFrame(edd_results)
+    edd_dataframe.to_csv(filepath, index=False)
     
     runtime_minutes = (time.time() - start_time) / 60
     print(f"EDD completed in {runtime_minutes:.1f} minutes")
@@ -201,16 +254,9 @@ def generate_edd_fast(table_name, output_path="/dbfs/FileStore/edd", filter_cond
     
     return filepath
 
-def generate_edd_ultra_fast(table_name, output_path="/dbfs/FileStore/edd", filter_condition=None, sample_rate=None):
+def generate_edd_ultra_fast(table_name, output_path="/tmp/edd", filter_condition=None, sample_rate=None):
     """
-    Ultra-fast EDD for very large tables - minimal statistics only
-    
-    This version computes only:
-    - Column types
-    - Null counts
-    - Approximate unique counts
-    - Basic stats (mean, min, max) for numeric columns only
-    - No percentiles, no top values
+    Ultra-fast EDD for very large tables - basic statistics only
     """
     
     print(f"Ultra-fast EDD for: {table_name}")
@@ -231,66 +277,73 @@ def generate_edd_ultra_fast(table_name, output_path="/dbfs/FileStore/edd", filte
     total_rows = df.count()
     print(f"Analyzing {total_rows:,} rows with minimal statistics")
     
-    columns = df.columns
+    column_names = df.columns
     column_types = dict(df.dtypes)
-    numeric_cols = [col for col, dtype in column_types.items() 
-                   if dtype in ['int', 'bigint', 'float', 'double', 'decimal']]
+    numeric_columns = [column_name for column_name, dtype in column_types.items() 
+                      if dtype in ['int', 'bigint', 'float', 'double', 'decimal']]
     
     # Batch null counts
-    null_counts_expr = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
-    null_results = df.select(null_counts_expr).collect()[0]
-    null_counts = {col: null_results[f"null_{col}"] for col in columns}
+    null_count_expressions = [spark_count(when(spark_col(column_name).isNull(), column_name)).alias(f"null_{column_name}") 
+                             for column_name in column_names]
+    null_results_row = df.select(null_count_expressions).collect()[0]
+    null_counts_dict = {column_name: null_results_row[f"null_{column_name}"] for column_name in column_names}
     
-    # Batch unique counts (approximate)
-    unique_counts_expr = [approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns]
-    unique_results = df.select(unique_counts_expr).collect()[0]
-    unique_counts = {col: unique_results[f"unique_{col}"] for col in columns}
+    # Batch unique counts
+    unique_count_expressions = [approx_count_distinct(spark_col(column_name)).alias(column_name) 
+                               for column_name in column_names]
+    unique_results_row = df.select(unique_count_expressions).collect()[0]
+    unique_counts_dict = {column_name: unique_results_row[column_name] for column_name in column_names}
     
     # Basic stats for numeric columns only
-    numeric_stats = {}
-    if numeric_cols:
-        stats_df = df.select(numeric_cols).describe()
-        stats_pandas = stats_df.toPandas().set_index('summary')
+    numeric_statistics = {}
+    if numeric_columns:
+        stats_df = df.select(numeric_columns).describe()
+        stats_pandas_df = stats_df.toPandas().set_index('summary')
         
-        for col in numeric_cols:
+        for column_name in numeric_columns:
             try:
-                numeric_stats[col] = {
-                    'mean': round(float(stats_pandas.loc['mean', col]), 4),
-                    'min': float(stats_pandas.loc['min', col]),
-                    'max': float(stats_pandas.loc['max', col]),
-                    'stddev': round(float(stats_pandas.loc['stddev', col]), 4)
+                numeric_statistics[column_name] = {
+                    'mean': round(float(stats_pandas_df.loc['mean', column_name]), 4),
+                    'min': float(stats_pandas_df.loc['min', column_name]),
+                    'max': float(stats_pandas_df.loc['max', column_name]),
+                    'stddev': round(float(stats_pandas_df.loc['stddev', column_name]), 4)
                 }
             except:
-                numeric_stats[col] = {'error': 'Stats_Error'}
+                numeric_statistics[column_name] = {'error': 'Stats_Error'}
     
     # Build results
-    results = []
-    for i, col_name in enumerate(columns, 1):
-        non_null_count = total_rows - null_counts[col_name]
+    edd_results = []
+    for field_index, column_name in enumerate(column_names, 1):
+        non_null_count = total_rows - null_counts_dict[column_name]
         
-        result = {
-            'Field_Num': i,
-            'Field_Name': col_name,
-            'Type': 'Numeric' if col_name in numeric_cols else 'Categorical',
-            'Num_Blanks': null_counts[col_name],
+        edd_result = {
+            'Field_Num': field_index,
+            'Field_Name': column_name,
+            'Type': 'Numeric' if column_name in numeric_columns else 'Categorical',
+            'Num_Blanks': null_counts_dict[column_name],
             'Num_Entries': non_null_count,
-            'Num_Unique': unique_counts[col_name]
+            'Num_Unique': unique_counts_dict[column_name]
         }
         
-        if col_name in numeric_stats:
-            result.update(numeric_stats[col_name])
+        if column_name in numeric_statistics:
+            edd_result.update(numeric_statistics[column_name])
         
-        results.append(result)
+        edd_results.append(edd_result)
     
     df.unpersist()
     
     # Save
-    os.makedirs(output_path, exist_ok=True)
+    try:
+        os.makedirs(output_path, exist_ok=True)
+    except:
+        output_path = "/tmp/edd"
+        os.makedirs(output_path, exist_ok=True)
+    
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     filename = f"{table_name.replace('.', '_')}_edd_ultrafast_{timestamp}.csv"
     filepath = os.path.join(output_path, filename)
     
-    pd.DataFrame(results).to_csv(filepath, index=False)
+    pd.DataFrame(edd_results).to_csv(filepath, index=False)
     
     runtime_minutes = (time.time() - start_time) / 60
     print(f"Ultra-fast EDD completed in {runtime_minutes:.1f} minutes")
@@ -298,54 +351,40 @@ def generate_edd_ultra_fast(table_name, output_path="/dbfs/FileStore/edd", filte
     
     return filepath
 
-# Batch functions
-def batch_edd_fast(table_list, output_path="/dbfs/FileStore/edd", sample_rate=None, ultra_fast=False):
+def batch_edd_fast(table_list, output_path="/tmp/edd", sample_rate=None, ultra_fast=False):
     """
     Batch EDD with fast processing
-    
-    Parameters:
-    table_list: List of table names
-    output_path: Output directory
-    sample_rate: Sampling rate for all tables
-    ultra_fast: Use ultra-fast mode (minimal stats only)
     """
     
-    func = generate_edd_ultra_fast if ultra_fast else generate_edd_fast
-    mode = "ultra-fast" if ultra_fast else "fast"
+    processing_function = generate_edd_ultra_fast if ultra_fast else generate_edd_fast
+    mode_description = "ultra-fast" if ultra_fast else "fast"
     
-    print(f"Batch EDD ({mode} mode) for {len(table_list)} tables")
-    results = {}
+    print(f"Batch EDD ({mode_description} mode) for {len(table_list)} tables")
+    batch_results = {}
     
-    for i, table in enumerate(table_list, 1):
-        print(f"\n[{i}/{len(table_list)}] {table}")
+    for table_index, table_name in enumerate(table_list, 1):
+        print(f"\n[{table_index}/{len(table_list)}] {table_name}")
         try:
-            filepath = func(table, output_path, sample_rate=sample_rate)
-            results[table] = filepath
-        except Exception as e:
-            print(f"ERROR: {e}")
-            results[table] = f"ERROR: {e}"
+            result_filepath = processing_function(table_name, output_path, sample_rate=sample_rate)
+            batch_results[table_name] = result_filepath
+        except Exception as error:
+            print(f"ERROR: {error}")
+            batch_results[table_name] = f"ERROR: {error}"
     
-    successful = len([r for r in results.values() if r.endswith('.csv')])
-    print(f"\nBatch complete: {successful}/{len(table_list)} successful")
+    successful_count = len([result for result in batch_results.values() if result.endswith('.csv')])
+    print(f"\nBatch complete: {successful_count}/{len(table_list)} successful")
     
-    return results
+    return batch_results
 
 # Usage examples
 if __name__ == "__main__":
-    
-    # Fast mode (5-10x faster than original)
-    # generate_edd_fast("your_table")
-    
-    # Ultra-fast mode (minimal stats, 20x faster)
-    # generate_edd_ultra_fast("your_table")
-    
-    # With sampling for huge tables
-    # generate_edd_fast("huge_table", sample_rate=0.01)
-    
-    # Batch processing
-    # tables = ["table1", "table2", "table3"]
-    # batch_edd_fast(tables, ultra_fast=True)
-    
-    print("Fast EDD functions ready")
-    print("Use generate_edd_fast() for 5-10x speedup")
-    print("Use generate_edd_ultra_fast() for 20x speedup")
+    print("Complete EDD System Ready")
+    print("Functions available:")
+    print("- generate_edd_fast(table_name) - Full EDD with all statistics")
+    print("- generate_edd_ultra_fast(table_name) - Minimal statistics, fastest")
+    print("- batch_edd_fast(table_list) - Process multiple tables")
+    print()
+    print("Example usage:")
+    print('generate_edd_fast("your_table_name")')
+    print('generate_edd_fast("large_table", filter_condition="year >= 2024")')
+    print('generate_edd_fast("huge_table", sample_rate=0.01)')
