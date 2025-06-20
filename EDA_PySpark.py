@@ -1,257 +1,199 @@
-# DATABRICKS USAGE EXAMPLES FOR EMPLOYEE_MAIN_MONTHLY EDA
-# ========================================================
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+import os
+import time
 
-# 1. IMMEDIATE QUICK INSPECTION (30 seconds)
-# -------------------------------------------
-def instant_table_check(table_name="employee_main_monthly"):
-    """Get immediate insights in under 30 seconds"""
+def generate_edd(table_name, output_path="/dbfs/FileStore/edd", filter_condition=None, sample_rate=None):
+    """
+    Generate EDD CSV file for a table
+    
+    Parameters:
+    table_name: Name of the table to analyze
+    output_path: Directory to save CSV file
+    filter_condition: Optional SQL WHERE condition (e.g., "year = 2024")
+    sample_rate: Optional sampling rate between 0 and 1 (e.g., 0.1 for 10%)
+    
+    Returns: Path to generated CSV file
+    """
+    
+    print(f"Generating EDD for: {table_name}")
+    
+    # Load table
     df = spark.table(table_name)
     
-    print(f"⚡ INSTANT TABLE CHECK: {table_name}")
-    print("=" * 50)
+    # Apply filter if provided
+    if filter_condition:
+        df = df.filter(filter_condition)
+        print(f"Applied filter: {filter_condition}")
     
-    # Basic info
-    print(f"📊 Dimensions: {df.count():,} rows × {len(df.columns)} columns")
+    # Apply sampling if provided
+    if sample_rate:
+        df = df.sample(sample_rate, seed=42)
+        print(f"Using {sample_rate*100}% sample")
     
-    # Schema preview
-    print(f"\n🏗️  Schema Preview:")
-    for i, field in enumerate(df.schema.fields[:10], 1):
-        print(f"  {i:2d}. {field.name:<25} | {str(field.dataType):<15}")
-    if len(df.columns) > 10:
-        print(f"     ... and {len(df.columns) - 10} more columns")
+    # Get row count
+    total_rows = df.count()
+    print(f"Analyzing {total_rows:,} rows")
     
-    # Sample data
-    print(f"\n🔍 Sample Data:")
-    df.show(3, truncate=True)
+    # Prepare results
+    results = []
+    columns = df.columns
     
-    return df
-
-# Execute immediate check
-df = instant_table_check("employee_main_monthly")
-
-
-# 2. COMPREHENSIVE ANALYSIS (5-10 minutes)
-# -----------------------------------------
-# Run the full EDA analysis
-results = analyze_employee_main_monthly(spark)
-
-
-# 3. FOCUSED ANALYSIS FOR SURVIVAL MODELING
-# ------------------------------------------
-def survival_focused_eda(table_name="employee_main_monthly"):
-    """EDA focused on survival analysis requirements"""
-    df = spark.table(table_name)
-    
-    print("🎯 SURVIVAL ANALYSIS FOCUSED EDA")
-    print("=" * 50)
-    
-    # 1. Identify key columns for survival analysis
-    all_cols = [field.name.lower() for field in df.schema.fields]
-    
-    # Employee identifier
-    id_candidates = [col for col in df.columns if any(term in col.lower() for term in ['id', 'employee', 'person', 'emp'])]
-    print(f"👤 Employee ID candidates: {id_candidates}")
-    
-    # Time-related columns (critical for survival)
-    time_candidates = [col for col in df.columns if any(term in col.lower() for term in 
-                      ['date', 'time', 'month', 'year', 'period', 'start', 'end', 'hire', 'term'])]
-    print(f"📅 Time-related columns: {time_candidates}")
-    
-    # Status/Event columns
-    status_candidates = [col for col in df.columns if any(term in col.lower() for term in 
-                        ['status', 'active', 'term', 'left', 'quit', 'exit', 'end', 'flag'])]
-    print(f"🚦 Status/Event columns: {status_candidates}")
-    
-    # Potential covariates
-    covariate_candidates = [col for col in df.columns if any(term in col.lower() for term in 
-                           ['salary', 'wage', 'pay', 'manager', 'dept', 'title', 'role', 'location', 
-                            'age', 'gender', 'tenure', 'performance', 'rating', 'hours', 'overtime'])]
-    print(f"📊 Potential Covariates: {covariate_candidates}")
-    
-    # 2. Check for time-varying structure
-    print(f"\n⏰ TIME-VARYING DATA CHECK")
-    print("-" * 30)
-    
-    if id_candidates and time_candidates:
-        # Check if we have multiple records per employee (time-varying)
-        id_col = id_candidates[0]  # Use first ID candidate
+    # Analyze each column
+    for i, col_name in enumerate(columns, 1):
+        print(f"Processing {i}/{len(columns)}: {col_name}")
         
-        total_employees = df.select(id_col).distinct().count()
-        total_records = df.count()
-        avg_records_per_employee = total_records / total_employees
-        
-        print(f"Total unique employees: {total_employees:,}")
-        print(f"Total records: {total_records:,}")
-        print(f"Avg records per employee: {avg_records_per_employee:.2f}")
-        
-        if avg_records_per_employee > 1.5:
-            print("✅ Time-varying data detected - suitable for survival analysis")
+        try:
+            # Basic counts
+            non_null_count = df.select(count(col(col_name))).collect()[0][0]
+            null_count = total_rows - non_null_count
+            unique_count = df.select(col_name).distinct().count()
             
-            # Show example of time-varying structure
-            print(f"\n📋 Example time-varying structure:")
-            sample_employee = df.select(id_col).distinct().limit(1).collect()[0][id_col]
-            employee_records = df.filter(col(id_col) == sample_employee).orderBy(*time_candidates[:1])
-            employee_records.show(10, truncate=False)
+            # Check if numeric
+            col_type = dict(df.dtypes)[col_name]
+            is_numeric = col_type in ['int', 'bigint', 'float', 'double', 'decimal']
             
-        else:
-            print("⚠️  Appears to be cross-sectional data - may need transformation")
-    
-    # 3. Missing data assessment for key variables
-    print(f"\n❌ MISSING DATA FOR KEY VARIABLES")
-    print("-" * 40)
-    
-    key_cols = id_candidates + time_candidates + status_candidates
-    for col_name in key_cols[:10]:  # Limit to avoid overwhelming output
-        null_count = df.filter(col(col_name).isNull()).count()
-        null_pct = (null_count / df.count()) * 100
-        print(f"{col_name:<25}: {null_count:>8,} nulls ({null_pct:>5.1f}%)")
-    
-    return {
-        'id_candidates': id_candidates,
-        'time_candidates': time_candidates,
-        'status_candidates': status_candidates,
-        'covariate_candidates': covariate_candidates,
-        'is_time_varying': avg_records_per_employee > 1.5 if id_candidates and time_candidates else False
-    }
-
-# Execute survival-focused analysis
-survival_info = survival_focused_eda("employee_main_monthly")
-
-
-# 4. COLUMN DEEP DIVE (for specific columns)
-# -------------------------------------------
-def deep_dive_column(table_name, column_name):
-    """Deep dive into a specific column"""
-    df = spark.table(table_name)
-    
-    print(f"🔬 DEEP DIVE: {column_name}")
-    print("=" * 40)
-    
-    # Basic info
-    col_type = dict(df.dtypes)[column_name]
-    print(f"Data Type: {col_type}")
-    
-    # Null analysis
-    total_count = df.count()
-    null_count = df.filter(col(column_name).isNull()).count()
-    print(f"Total records: {total_count:,}")
-    print(f"Null records: {null_count:,} ({null_count/total_count*100:.2f}%)")
-    
-    # Type-specific analysis
-    if col_type in ['string']:
-        # Categorical analysis
-        unique_count = df.select(column_name).distinct().count()
-        print(f"Unique values: {unique_count:,}")
+            if is_numeric:
+                # Numeric analysis
+                try:
+                    stats = df.select(col_name).na.drop().describe().collect()
+                    stats_dict = {row['summary']: float(row[col_name]) for row in stats}
+                    
+                    percentiles = df.select(col_name).na.drop().approxQuantile(
+                        col_name, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99], 0.05)
+                    
+                    results.append({
+                        'Field_Num': i,
+                        'Field_Name': col_name,
+                        'Type': 'Numeric',
+                        'Num_Blanks': null_count,
+                        'Num_Entries': non_null_count,
+                        'Num_Unique': unique_count,
+                        'Mean': round(stats_dict.get('mean', 0), 4),
+                        'Stddev': round(stats_dict.get('stddev', 0), 4),
+                        'Min': stats_dict.get('min', 0),
+                        'P1': percentiles[0] if len(percentiles) > 0 else None,
+                        'P5': percentiles[1] if len(percentiles) > 1 else None,
+                        'P25': percentiles[2] if len(percentiles) > 2 else None,
+                        'Median': percentiles[3] if len(percentiles) > 3 else None,
+                        'P75': percentiles[4] if len(percentiles) > 4 else None,
+                        'P95': percentiles[5] if len(percentiles) > 5 else None,
+                        'P99': percentiles[6] if len(percentiles) > 6 else None,
+                        'Max': stats_dict.get('max', 0)
+                    })
+                except:
+                    # Fallback for numeric columns that fail
+                    results.append({
+                        'Field_Num': i,
+                        'Field_Name': col_name,
+                        'Type': 'Numeric',
+                        'Num_Blanks': null_count,
+                        'Num_Entries': non_null_count,
+                        'Num_Unique': unique_count,
+                        'Note': 'Stats_Error'
+                    })
+            else:
+                # Categorical analysis
+                result = {
+                    'Field_Num': i,
+                    'Field_Name': col_name,
+                    'Type': 'Categorical',
+                    'Num_Blanks': null_count,
+                    'Num_Entries': non_null_count,
+                    'Num_Unique': unique_count
+                }
+                
+                # Get top values if not too many unique values
+                if unique_count <= 1000 and non_null_count > 0:
+                    try:
+                        top_values = (df.select(col_name)
+                                    .na.drop()
+                                    .groupBy(col_name)
+                                    .count()
+                                    .orderBy(desc("count"))
+                                    .limit(5)
+                                    .collect())
+                        
+                        for j, row in enumerate(top_values):
+                            result[f'Top_{j+1}'] = f"{row[col_name]}:{row['count']}"
+                    except:
+                        result['Note'] = 'Top_Values_Error'
+                else:
+                    result['Note'] = 'High_Cardinality' if unique_count > 1000 else 'No_Data'
+                
+                results.append(result)
         
-        if unique_count <= 50:
-            print("\nValue distribution:")
-            df.groupBy(column_name).count().orderBy(desc("count")).show(20)
-        else:
-            print("\nTop 10 values:")
-            df.groupBy(column_name).count().orderBy(desc("count")).show(10)
-            
-    elif col_type in ['int', 'bigint', 'double', 'float']:
-        # Numeric analysis
-        stats = df.select(column_name).describe().collect()
-        for stat in stats:
-            print(f"{stat['summary']}: {stat[column_name]}")
-            
-        # Percentiles
-        percentiles = df.select(column_name).na.drop().approxQuantile(column_name, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99], 0.01)
-        print(f"\nPercentiles:")
-        print(f"1%: {percentiles[0]:.4f}, 5%: {percentiles[1]:.4f}, 25%: {percentiles[2]:.4f}")
-        print(f"50%: {percentiles[3]:.4f}, 75%: {percentiles[4]:.4f}, 95%: {percentiles[5]:.4f}, 99%: {percentiles[6]:.4f}")
-        
-    elif col_type in ['date', 'timestamp']:
-        # Date analysis
-        date_stats = df.select(
-            min(column_name).alias('min_date'),
-            max(column_name).alias('max_date')
-        ).collect()[0]
-        
-        print(f"Date range: {date_stats['min_date']} to {date_stats['max_date']}")
-        
-        # Show monthly distribution if it's a date
-        print("\nMonthly distribution:")
-        df.select(date_format(column_name, "yyyy-MM").alias("month")) \
-          .groupBy("month") \
-          .count() \
-          .orderBy("month") \
-          .show(20)
+        except Exception as e:
+            # Error handling
+            results.append({
+                'Field_Num': i,
+                'Field_Name': col_name,
+                'Type': 'Error',
+                'Num_Blanks': 0,
+                'Num_Entries': 0,
+                'Num_Unique': 0,
+                'Error': str(e)
+            })
+    
+    # Save to CSV
+    os.makedirs(output_path, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
+    filepath = os.path.join(output_path, filename)
+    
+    pd.DataFrame(results).to_csv(filepath, index=False)
+    
+    print(f"EDD saved: {filepath}")
+    return filepath
 
-# Example usage for specific columns
-# deep_dive_column("employee_main_monthly", "employee_id")  # Replace with actual column name
+# Batch function for multiple tables
+def batch_edd(table_list, output_path="/dbfs/FileStore/edd", sample_rate=None):
+    """
+    Generate EDD for multiple tables
+    
+    Parameters:
+    table_list: List of table names
+    output_path: Directory to save CSV files
+    sample_rate: Optional sampling rate for all tables
+    """
+    
+    print(f"Batch EDD for {len(table_list)} tables")
+    results = {}
+    
+    for i, table in enumerate(table_list, 1):
+        print(f"\n[{i}/{len(table_list)}] {table}")
+        try:
+            filepath = generate_edd(table, output_path, sample_rate=sample_rate)
+            results[table] = filepath
+        except Exception as e:
+            print(f"ERROR: {e}")
+            results[table] = f"ERROR: {e}"
+    
+    print(f"\nBatch complete:")
+    for table, result in results.items():
+        status = "SUCCESS" if result.endswith('.csv') else "FAILED"
+        print(f"  {table}: {status}")
+    
+    return results
 
-
-# 5. QUICK COMMANDS FOR IMMEDIATE USE
-# ------------------------------------
-
-# Get column names only
-def get_columns(table_name="employee_main_monthly"):
-    """Quick column list"""
-    df = spark.table(table_name)
-    return df.columns
-
-# Show first few rows
-def peek(table_name="employee_main_monthly", rows=5):
-    """Quick peek at data"""
-    spark.table(table_name).show(rows, truncate=False)
-
-# Get table size
-def table_size(table_name="employee_main_monthly"):
-    """Quick size check"""
-    df = spark.table(table_name)
-    return f"{df.count():,} rows × {len(df.columns)} columns"
-
-# Check if table exists
-def table_exists(table_name):
-    """Check if table exists"""
-    try:
-        spark.table(table_name).limit(1).collect()
-        return True
-    except:
-        return False
-
-# EXECUTION EXAMPLES
-# ==================
-
-print("🚀 READY TO ANALYZE employee_main_monthly")
-print("=" * 50)
-print("Available functions:")
-print("1. instant_table_check() - 30 second overview")
-print("2. comprehensive_table_eda() - Full 5-10 minute analysis")  
-print("3. survival_focused_eda() - Survival analysis specific")
-print("4. deep_dive_column() - Individual column analysis")
-print("5. Quick utilities: get_columns(), peek(), table_size()")
-print()
-print("Example usage:")
-print("# Quick start:")
-print("df = instant_table_check('employee_main_monthly')")
-print()
-print("# Full analysis:")
-print("results = comprehensive_table_eda(spark, 'employee_main_monthly')")
-print()
-print("# Survival focus:")
-print("survival_info = survival_focused_eda('employee_main_monthly')")
-
-# FOR IMMEDIATE EXECUTION - UNCOMMENT THE LINES BELOW:
-# =====================================================
-
-# Step 1: Quick check (30 seconds)
-print("\n" + "="*60)
-print("STEP 1: QUICK TABLE CHECK")
-print("="*60)
-df = instant_table_check("employee_main_monthly")
-
-# Step 2: Survival-focused analysis (2-3 minutes)  
-print("\n" + "="*60)
-print("STEP 2: SURVIVAL ANALYSIS FOCUS")
-print("="*60)
-survival_info = survival_focused_eda("employee_main_monthly")
-
-# Step 3: Full comprehensive analysis (5-10 minutes)
-# Uncomment below when ready for full analysis:
-# print("\n" + "="*60)
-# print("STEP 3: COMPREHENSIVE ANALYSIS")  
-# print("="*60)
-# results = comprehensive_table_eda(spark, "employee_main_monthly")
+# Simple usage examples
+if __name__ == "__main__":
+    
+    # Single table
+    # generate_edd("employee_main_monthly")
+    
+    # Single table with filter
+    # generate_edd("large_table", filter_condition="year >= 2024")
+    
+    # Single table with sampling
+    # generate_edd("huge_table", sample_rate=0.01)
+    
+    # Multiple tables
+    # tables = ["table1", "table2", "table3"]
+    # batch_edd(tables)
+    
+    # Multiple tables with sampling
+    # batch_edd(tables, sample_rate=0.1)
+    
+    print("EDD functions ready to use")
