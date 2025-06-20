@@ -1,24 +1,16 @@
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col, count, when, desc, approx_count_distinct, isnan, isnull
+from pyspark.sql.functions import col, count, when, desc, lit, isnan, isnull
+from pyspark.sql.types import DoubleType, StringType
 import pandas as pd
 import os
 import time
 from typing import List, Optional, Dict, Any
 
-def generate_edd(table_name: str, output_path: str = "/tmp/edd", 
+def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                 filter_condition: Optional[str] = None, 
                 sample_threshold: int = 50_000_000) -> str:
     """
-    Generate EDD for a single table with intelligent sampling
-    
-    Args:
-        table_name: Spark table name
-        output_path: Output directory 
-        filter_condition: Optional WHERE clause
-        sample_threshold: Row count threshold for sampling
-    
-    Returns:
-        Path to generated CSV file
+    Generate EDD following original logic - dynamic type detection during processing
     """
     
     print(f"Processing: {table_name}")
@@ -39,62 +31,36 @@ def generate_edd(table_name: str, output_path: str = "/tmp/edd",
         total_rows = df.count()
     
     df.cache()
-    
     columns = df.columns
     print(f"Analyzing {total_rows:,} rows, {len(columns)} columns")
     
-    # Batch compute basic statistics
-    null_exprs = [count(when(col(c).isNull() | isnan(col(c)), c)).alias(f"null_{c}") for c in columns]
-    unique_exprs = [approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns]
+    # Convert all columns to string first (like original EDD reads CSV)
+    df_str = df.select([col(c).cast(StringType()).alias(c) for c in columns])
     
-    null_counts = df.select(null_exprs).collect()[0].asDict()
-    unique_counts = df.select(unique_exprs).collect()[0].asDict()
-    
-    # Process each column for type detection and stats
+    # Process each column following original EDD logic
     results = []
+    
     for i, column_name in enumerate(columns, 1):
-        null_count = null_counts[f"null_{column_name}"]
-        unique_count = unique_counts[f"unique_{column_name}"]
+        print(f"Processing column {i}/{len(columns)}: {column_name}")
+        
+        # Get basic counts
+        null_count = df_str.filter(col(column_name).isNull() | (col(column_name) == "")).count()
         non_null_count = total_rows - null_count
         
-        # Attempt numeric processing first
-        numeric_stats = _get_numeric_stats(df, column_name)
+        if non_null_count == 0:
+            # All null column
+            results.append(_create_empty_column_result(i, column_name, null_count, 0, 0))
+            continue
         
-        if numeric_stats:
-            # Numeric column
-            percentiles = _get_percentiles(df, column_name)
-            result = {
-                'Field_Num': i,
-                'Field_Name': column_name,
-                'Type': 'Numeric',
-                'Num_Blanks': null_count,
-                'Num_Entries': non_null_count,
-                'Num_Unique': unique_count,
-                'Stddev': numeric_stats.get('stddev'),
-                'Mean_or_Top1': numeric_stats.get('mean'),
-                'Min_or_Top2': numeric_stats.get('min'),
-                'P1_or_Top3': percentiles[0] if percentiles else None,
-                'P5_or_Top4': percentiles[1] if percentiles else None,
-                'P25_or_Top5': percentiles[2] if percentiles else None,
-                'Median_or_Bot5': percentiles[3] if percentiles else None,
-                'P75_or_Bot4': percentiles[4] if percentiles else None,
-                'P95_or_Bot3': percentiles[5] if percentiles else None,
-                'P99_or_Bot2': percentiles[6] if percentiles else None,
-                'Max_or_Bot1': numeric_stats.get('max')
-            }
+        # Try to determine if column is numeric by attempting conversion
+        is_numeric, numeric_data = _test_numeric_conversion(df_str, column_name)
+        
+        if is_numeric and len(numeric_data) > 0:
+            # Process as numeric
+            result = _process_numeric_column(i, column_name, numeric_data, null_count, non_null_count)
         else:
-            # Categorical column
-            cat_values = _get_categorical_stats(df, column_name, unique_count, non_null_count)
-            result = {
-                'Field_Num': i,
-                'Field_Name': column_name,
-                'Type': 'Categorical',
-                'Num_Blanks': null_count,
-                'Num_Entries': non_null_count,
-                'Num_Unique': unique_count,
-                'Stddev': None,
-                **cat_values
-            }
+            # Process as categorical  
+            result = _process_categorical_column(df_str, i, column_name, null_count, non_null_count, total_rows)
         
         results.append(result)
     
@@ -113,149 +79,185 @@ def generate_edd(table_name: str, output_path: str = "/tmp/edd",
     
     return filepath
 
-def _get_numeric_stats(df, column_name: str) -> Optional[Dict[str, Any]]:
-    """Attempt to get numeric statistics for a column"""
+def _test_numeric_conversion(df_str, column_name: str) -> tuple[bool, List[float]]:
+    """Test if column can be converted to numeric, following original EDD logic"""
+    
     try:
-        # Try to cast to double and get basic stats
-        numeric_df = df.select(col(column_name).cast("double").alias(column_name))
-        stats = numeric_df.select(column_name).describe().toPandas().set_index('summary')
+        # Get non-null, non-empty values
+        non_empty_df = df_str.filter((col(column_name).isNotNull()) & (col(column_name) != ""))
         
-        # Check if we have valid numeric data
-        if stats.loc['count', column_name] == '0':
-            return None
-            
-        return {
-            'mean': round(float(stats.loc['mean', column_name]), 6),
-            'stddev': round(float(stats.loc['stddev', column_name]), 6),
-            'min': float(stats.loc['min', column_name]),
-            'max': float(stats.loc['max', column_name])
-        }
-    except:
-        return None
+        # Try to convert to double - this will fail if any non-numeric values exist
+        numeric_df = non_empty_df.select(col(column_name).cast(DoubleType()).alias("numeric_val"))
+        
+        # Check if conversion resulted in nulls (meaning non-numeric data exists)
+        null_after_conversion = numeric_df.filter(col("numeric_val").isNull()).count()
+        
+        if null_after_conversion > 0:
+            # Some values couldn't be converted - treat as categorical
+            return False, []
+        
+        # All values converted successfully - collect numeric data
+        numeric_values = [row.numeric_val for row in numeric_df.collect() if row.numeric_val is not None]
+        
+        return True, numeric_values
+        
+    except Exception as e:
+        # Any error means not numeric
+        return False, []
 
-def _get_percentiles(df, column_name: str) -> Optional[List[float]]:
-    """Get percentiles for numeric column"""
+def _process_numeric_column(field_num: int, column_name: str, numeric_data: List[float], 
+                          null_count: int, non_null_count: int) -> Dict:
+    """Process numeric column following original EDD format"""
+    
+    if not numeric_data:
+        return _create_empty_column_result(field_num, column_name, null_count, non_null_count, 0, col_type="Numeric")
+    
+    import numpy as np
+    
+    # Convert to numpy array for calculations (like original)
+    arr = np.array(numeric_data)
+    
+    # Calculate statistics
+    mean_val = float(np.mean(arr))
+    std_val = float(np.std(arr))
+    min_val = float(np.min(arr))
+    max_val = float(np.max(arr))
+    
+    # Calculate percentiles
     try:
-        percentile_values = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]
-        return df.select(column_name).na.drop().approxQuantile(column_name, percentile_values, 0.01)
+        p1 = float(np.percentile(arr, 1))
+        p5 = float(np.percentile(arr, 5))
+        p25 = float(np.percentile(arr, 25))
+        median = float(np.percentile(arr, 50))
+        p75 = float(np.percentile(arr, 75))
+        p95 = float(np.percentile(arr, 95))
+        p99 = float(np.percentile(arr, 99))
     except:
-        return None
-
-def _get_categorical_stats(df, column_name: str, unique_count: int, non_null_count: int) -> Dict[str, str]:
-    """Get categorical statistics following original EDD format"""
+        p1 = p5 = p25 = median = p75 = p95 = p99 = None
     
-    # Handle special cases
-    if unique_count == 0:
-        default_val = 'No_Data'
-    elif unique_count == 1:
-        # Get the actual single value
-        try:
-            single_val = df.select(column_name).filter(col(column_name).isNotNull()).first()
-            if single_val:
-                default_val = f"{single_val[0]}:{non_null_count}"
-            else:
-                default_val = 'All_Same'
-        except:
-            default_val = 'All_Same'
-    elif unique_count == non_null_count:
-        default_val = 'All_Unique'
-    else:
-        # Get frequency distribution - need more than 10 to get top AND bottom values
-        try:
-            # For high cardinality, limit to reasonable number to get top/bottom split
-            limit_size = min(1000, max(100, unique_count))
-            
-            all_values = (df.select(column_name)
-                         .filter(col(column_name).isNotNull())
-                         .groupBy(column_name)
-                         .count()
-                         .orderBy(desc("count"), col(column_name))  # Secondary sort for consistency
-                         .limit(limit_size)
-                         .collect())
-            
-            if all_values and len(all_values) >= 10:
-                # Convert to list of formatted strings
-                formatted_values = [f"{row[column_name]}:{row['count']}" for row in all_values]
-                
-                # Get top 5 and bottom 5 following original EDD logic
-                top_5 = formatted_values[:5]
-                bottom_5 = formatted_values[-5:] if len(formatted_values) > 5 else formatted_values
-                
-                # Pad if needed
-                top_5.extend([''] * (5 - len(top_5)))
-                bottom_5.extend([''] * (5 - len(bottom_5)))
-                
-                return {
-                    'Mean_or_Top1': top_5[0],
-                    'Min_or_Top2': top_5[1], 
-                    'P1_or_Top3': top_5[2],
-                    'P5_or_Top4': top_5[3],
-                    'P25_or_Top5': top_5[4],
-                    'Median_or_Bot5': bottom_5[-5] if len(bottom_5) >= 5 else bottom_5[0],
-                    'P75_or_Bot4': bottom_5[-4] if len(bottom_5) >= 4 else bottom_5[0],
-                    'P95_or_Bot3': bottom_5[-3] if len(bottom_5) >= 3 else bottom_5[0],
-                    'P99_or_Bot2': bottom_5[-2] if len(bottom_5) >= 2 else bottom_5[0],  
-                    'Max_or_Bot1': bottom_5[-1]
-                }
-            else:
-                # Fallback for low data
-                cat_values = [f"{row[column_name]}:{row['count']}" for row in all_values] if all_values else []
-                cat_values.extend([''] * (10 - len(cat_values)))
-                
-                return {
-                    'Mean_or_Top1': cat_values[0],
-                    'Min_or_Top2': cat_values[1],
-                    'P1_or_Top3': cat_values[2], 
-                    'P5_or_Top4': cat_values[3],
-                    'P25_or_Top5': cat_values[4],
-                    'Median_or_Bot5': cat_values[5],
-                    'P75_or_Bot4': cat_values[6],
-                    'P95_or_Bot3': cat_values[7],
-                    'P99_or_Bot2': cat_values[8],
-                    'Max_or_Bot1': cat_values[9]
-                }
-        except:
-            cat_values = ['High_Cardinality'] * 10
-            return {
-                'Mean_or_Top1': cat_values[0],
-                'Min_or_Top2': cat_values[1], 
-                'P1_or_Top3': cat_values[2],
-                'P5_or_Top4': cat_values[3],
-                'P25_or_Top5': cat_values[4],
-                'Median_or_Bot5': cat_values[5],
-                'P75_or_Bot4': cat_values[6],
-                'P95_or_Bot3': cat_values[7],
-                'P99_or_Bot2': cat_values[8],
-                'Max_or_Bot1': cat_values[9]
-            }
-    
-    # For special cases, use same value across all fields
     return {
-        'Mean_or_Top1': default_val,
-        'Min_or_Top2': default_val,
-        'P1_or_Top3': default_val,
-        'P5_or_Top4': default_val,
-        'P25_or_Top5': default_val,
-        'Median_or_Bot5': default_val,
-        'P75_or_Bot4': default_val,
-        'P95_or_Bot3': default_val,
-        'P99_or_Bot2': default_val,
-        'Max_or_Bot1': default_val
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Numeric',
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': len(set(numeric_data)),
+        'Stddev': round(std_val, 6) if not np.isnan(std_val) else None,
+        'Mean_or_Top1': round(mean_val, 6) if not np.isnan(mean_val) else None,
+        'Min_or_Top2': min_val,
+        'P1_or_Top3': p1,
+        'P5_or_Top4': p5,
+        'P25_or_Top5': p25,
+        'Median_or_Bot5': median,
+        'P75_or_Bot4': p75,
+        'P95_or_Bot3': p95,
+        'P99_or_Bot2': p99,
+        'Max_or_Bot1': max_val
     }
 
-def batch_edd(table_list: List[str], output_path: str = "/tmp/edd", 
+def _process_categorical_column(df_str, field_num: int, column_name: str, 
+                              null_count: int, non_null_count: int, total_rows: int) -> Dict:
+    """Process categorical column following original EDD format exactly"""
+    
+    # Get value counts
+    try:
+        value_counts = (df_str.filter((col(column_name).isNotNull()) & (col(column_name) != ""))
+                       .groupBy(column_name)
+                       .count()
+                       .orderBy(desc("count"), col(column_name))  # Secondary sort for consistency
+                       .collect())
+        
+        unique_count = len(value_counts)
+        
+        # Create value frequency list like original EDD
+        cat_values = [(row[column_name], row['count']) for row in value_counts]
+        
+    except Exception as e:
+        print(f"Error processing categorical column {column_name}: {e}")
+        unique_count = 0
+        cat_values = []
+    
+    # Handle special cases following original logic
+    if unique_count == 1:
+        # All same value
+        val_str = f"{cat_values[0][0]}:{cat_values[0][1]}" if cat_values else "All_Same"
+        cat_display = [val_str] + ["All_Same"] * 19
+    elif unique_count == non_null_count:
+        # All unique
+        cat_display = ["All_Unique"] * 20
+    elif unique_count == 0:
+        # No data
+        cat_display = ["No_Data"] * 20
+    else:
+        # Normal case - format as value:count
+        cat_display = [f"{val}:{count}" for val, count in cat_values]
+        # Pad to 20 elements
+        cat_display.extend([""] * max(0, 20 - len(cat_display)))
+    
+    # Map to EDD format following original indexing
+    return {
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Categorical',
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Stddev': None,
+        'Mean_or_Top1': cat_display[0],
+        'Min_or_Top2': cat_display[1] if len(cat_display) > 1 else cat_display[0],
+        'P1_or_Top3': cat_display[2] if len(cat_display) > 2 else cat_display[0],
+        'P5_or_Top4': cat_display[3] if len(cat_display) > 3 else cat_display[0],
+        'P25_or_Top5': cat_display[4] if len(cat_display) > 4 else cat_display[0],
+        'Median_or_Bot5': cat_display[-5] if len(cat_display) >= 5 else cat_display[0],
+        'P75_or_Bot4': cat_display[-4] if len(cat_display) >= 4 else cat_display[0],
+        'P95_or_Bot3': cat_display[-3] if len(cat_display) >= 3 else cat_display[0],
+        'P99_or_Bot2': cat_display[-2] if len(cat_display) >= 2 else cat_display[0],
+        'Max_or_Bot1': cat_display[-1] if len(cat_display) >= 1 else cat_display[0]
+    }
+
+def _create_empty_column_result(field_num: int, column_name: str, null_count: int, 
+                              non_null_count: int, unique_count: int, col_type: str = "Categorical") -> Dict:
+    """Create result for empty/all-null columns"""
+    
+    base_result = {
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': col_type,
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Stddev': None,
+        'Mean_or_Top1': 'No_Data',
+        'Min_or_Top2': 'No_Data',
+        'P1_or_Top3': 'No_Data',
+        'P5_or_Top4': 'No_Data',
+        'P25_or_Top5': 'No_Data',
+        'Median_or_Bot5': 'No_Data',
+        'P75_or_Bot4': 'No_Data',
+        'P95_or_Bot3': 'No_Data',
+        'P99_or_Bot2': 'No_Data',
+        'Max_or_Bot1': 'No_Data'
+    }
+    
+    if col_type == "Numeric":
+        base_result.update({
+            'Mean_or_Top1': None,
+            'Min_or_Top2': None,
+            'P1_or_Top3': None,
+            'P5_or_Top4': None,
+            'P25_or_Top5': None,
+            'Median_or_Bot5': None,
+            'P75_or_Bot4': None,
+            'P95_or_Bot3': None,
+            'P99_or_Bot2': None,
+            'Max_or_Bot1': None
+        })
+    
+    return base_result
+
+def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
               sample_threshold: int = 50_000_000) -> Dict[str, str]:
-    """
-    Process multiple tables and generate batch summary
-    
-    Args:
-        table_list: List of table names
-        output_path: Output directory
-        sample_threshold: Row threshold for sampling
-    
-    Returns:
-        Dictionary mapping table names to file paths or error messages
-    """
+    """Process multiple tables and generate batch summary"""
     
     print(f"Starting batch EDD for {len(table_list)} tables")
     batch_start = time.time()
@@ -272,8 +274,6 @@ def batch_edd(table_list: List[str], output_path: str = "/tmp/edd",
             elapsed = time.time() - start_time
             
             results[table_name] = filepath
-            
-            # Collect summary info
             summary_data.append({
                 'Table_Name': table_name,
                 'Status': 'Success',
@@ -298,7 +298,6 @@ def batch_edd(table_list: List[str], output_path: str = "/tmp/edd",
     summary_file = os.path.join(output_path, f"batch_summary_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     pd.DataFrame(summary_data).to_csv(summary_file, index=False)
     
-    # Print final summary
     successful = sum(1 for r in results.values() if r.endswith('.csv'))
     total_time = (time.time() - batch_start) / 60
     
@@ -307,15 +306,57 @@ def batch_edd(table_list: List[str], output_path: str = "/tmp/edd",
     
     return results
 
+# Helper functions for file management
+def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
+    """List all EDD files in the output directory"""
+    
+    try:
+        if os.path.exists(output_path):
+            files = [f for f in os.listdir(output_path) if f.endswith('.csv')]
+            
+            if files:
+                print(f"EDD files in {output_path}:")
+                for i, filename in enumerate(files, 1):
+                    filepath = os.path.join(output_path, filename)
+                    size_mb = os.path.getsize(filepath) / (1024*1024)
+                    print(f"{i:2d}. {filename} ({size_mb:.2f} MB)")
+                
+                print(f"\nTo download: Use Data → DBFS → tmp → edd in Databricks UI")
+            else:
+                print("No EDD files found")
+        else:
+            print(f"Directory {output_path} does not exist")
+            
+    except Exception as e:
+        print(f"Error listing files: {e}")
+
+def display_edd_file(filepath: str, num_rows: int = 20) -> None:
+    """Display EDD file contents in notebook"""
+    
+    try:
+        df = pd.read_csv(filepath)
+        
+        print(f"EDD File: {os.path.basename(filepath)}")
+        print(f"Columns analyzed: {len(df)}")
+        print(f"File size: {os.path.getsize(filepath) / 1024:.1f} KB")
+        print("-" * 80)
+        
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', 50)
+        
+        display(df.head(num_rows))
+        
+        if len(df) > num_rows:
+            print(f"\n... showing first {num_rows} of {len(df)} total columns")
+            
+    except Exception as e:
+        print(f"Error displaying file: {e}")
+
 # Usage examples
 if __name__ == "__main__":
-    # Single table
-    # generate_edd("my_database.large_table")
-    
-    # Batch processing
-    # tables = ["db.table1", "db.table2", "db.table3"]
-    # batch_edd(tables)
-    
     print("EDD system ready. Key functions:")
     print("- generate_edd(table_name)")  
     print("- batch_edd(table_list)")
+    print("- list_edd_files() - to see generated files")
+    print("- display_edd_file(filepath) - to view EDD in notebook")
