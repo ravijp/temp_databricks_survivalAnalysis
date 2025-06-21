@@ -133,6 +133,10 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
                 result = _build_temporal_result(i, col_name, total_rows, actual_sample_size,
                                               null_count, non_null_count, unique_count,
                                               temporal_stats.get(col_name, {}))
+                # If temporal processing failed, fallback to categorical
+                if result is None:
+                    result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, actual_sample_size,
+                                                     null_count, non_null_count, unique_count)
             elif col_name in boolean_columns:
                 result = _build_boolean_result(i, col_name, total_rows, actual_sample_size,
                                              null_count, non_null_count, unique_count,
@@ -299,29 +303,16 @@ def _classify_numeric_distribution(mean: Optional[float], median: Optional[float
 
 def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
                           null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
-    """Build temporal column result with date-specific insights"""
-    if 'error' in stats or not stats:
-        return _build_error_result(field_num, column_name, total_rows, sample_size, "Temporal stats calculation failed")
+    """Build temporal column result with simple date insights"""
     
-    # Format dates as strings for CSV output
-    min_date = str(stats.get('min_date', '')) if stats.get('min_date') else ''
-    max_date = str(stats.get('max_date', '')) if stats.get('max_date') else ''
+    # Check if we should fallback to categorical processing
+    if stats.get('fallback_to_categorical'):
+        return None  # Signal to use categorical processing instead
     
-    # Get percentiles (may be None)
-    percentiles = stats.get('percentiles', [None] * 7)
-    percentile_strs = []
-    for p in percentiles:
-        if p is not None:
-            percentile_strs.append(str(p))
-        else:
-            percentile_strs.append('')
-    
-    # Pad to ensure 7 elements
-    percentile_strs = (percentile_strs + [''] * 7)[:7]
-    
-    # Use median date or most common pattern as "mean"
-    median_date = percentile_strs[3] if len(percentile_strs) > 3 else ''
-    mean_or_pattern = median_date if median_date else stats.get('frequency_pattern', 'Unknown')
+    min_date = stats.get('min_date', '')
+    max_date = stats.get('max_date', '')
+    date_range_days = stats.get('date_range_days', 0)
+    frequency_pattern = stats.get('frequency_pattern', 'Temporal')
     
     return {
         'Field_Num': field_num,
@@ -332,18 +323,18 @@ def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sa
         'Num_Blanks': null_count,
         'Num_Entries': non_null_count,
         'Num_Unique': unique_count,
-        'Outlier_Count': stats.get('outlier_count', 0),
-        'Distribution_Shape': stats.get('frequency_pattern', 'Unknown'),
-        'Stddev': stats.get('date_range_days', 0),  # Date range as "spread"
-        'Mean_or_Top1': mean_or_pattern,
+        'Outlier_Count': 0,
+        'Distribution_Shape': frequency_pattern,
+        'Stddev': date_range_days,
+        'Mean_or_Top1': frequency_pattern,
         'Min_or_Top2': min_date,
-        'P1_or_Top3': percentile_strs[0],
-        'P5_or_Top4': percentile_strs[1],
-        'P25_or_Top5': percentile_strs[2],
-        'Median_or_Bot5': percentile_strs[3],
-        'P75_or_Bot4': percentile_strs[4],
-        'P95_or_Bot3': percentile_strs[5],
-        'P99_or_Bot2': percentile_strs[6],
+        'P1_or_Top3': '',
+        'P5_or_Top4': '',
+        'P25_or_Top5': '',
+        'Median_or_Bot5': '',
+        'P75_or_Bot4': '',
+        'P95_or_Bot3': '',
+        'P99_or_Bot2': '',
         'Max_or_Bot1': max_date
     }
 
@@ -414,7 +405,7 @@ def _build_complex_result(field_num: int, column_name: str, total_rows: int, sam
     }
 
 def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
-    """Get temporal statistics for date/timestamp columns"""
+    """Get temporal statistics with simple fallback to categorical processing"""
     if not temporal_columns:
         return {}
     
@@ -422,79 +413,42 @@ def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
     
     for col_name in temporal_columns:
         try:
-            # Convert to unix timestamp for percentile calculations
+            # Simple approach - get min/max dates only
             temp_df = df.select(col_name).filter(col(col_name).isNotNull())
             
-            # Get min/max dates
+            if temp_df.count() == 0:
+                temporal_stats[col_name] = {'fallback_to_categorical': True}
+                continue
+            
+            # Try basic min/max - if this fails, fallback to categorical
             min_max = temp_df.agg(
                 F.min(col_name).alias('min_date'),
                 F.max(col_name).alias('max_date')
             ).collect()[0]
             
-            min_date = min_max['min_date']
-            max_date = min_max['max_date']
+            min_date = str(min_max['min_date']) if min_max['min_date'] else ''
+            max_date = str(min_max['max_date']) if min_max['max_date'] else ''
             
-            # Calculate date range in days
-            if min_date and max_date:
-                date_range_days = (max_date - min_date).days if hasattr((max_date - min_date), 'days') else 0
-            else:
-                date_range_days = 0
-            
-            # Get percentiles using unix timestamp
-            percentile_values = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]
+            # Calculate simple date range
             try:
-                percentile_df = temp_df.select(F.unix_timestamp(col_name).alias('unix_ts'))
-                percentiles_unix = percentile_df.approxQuantile('unix_ts', percentile_values, 0.01)
-                
-                # Convert back to dates
-                percentiles = []
-                for ts in percentiles_unix:
-                    if ts is not None:
-                        percentiles.append(F.from_unixtime(ts).cast('date'))
-                    else:
-                        percentiles.append(None)
-            except:
-                percentiles = [None] * 7
-            
-            # Determine frequency pattern
-            unique_dates = temp_df.approxCountDistinct().collect()[0][0]
-            total_records = temp_df.count()
-            
-            if unique_dates == total_records:
-                frequency_pattern = "Unique_Timestamps"
-            elif date_range_days > 0:
-                avg_records_per_day = total_records / date_range_days
-                if avg_records_per_day >= 50:
-                    frequency_pattern = "Multiple_Daily"
-                elif avg_records_per_day >= 5:
-                    frequency_pattern = "Daily"
-                elif avg_records_per_day >= 0.5:
-                    frequency_pattern = "Weekly"
+                if min_max['min_date'] and min_max['max_date']:
+                    date_range_days = (min_max['max_date'] - min_max['min_date']).days
                 else:
-                    frequency_pattern = "Monthly_Sparse"
-            else:
-                frequency_pattern = "Single_Date"
-            
-            # Simple outlier detection for dates (future dates or very old dates)
-            outlier_count = 0
-            try:
-                future_dates = df.select(col_name).filter(col(col_name) > F.current_date()).count()
-                very_old_dates = df.select(col_name).filter(col(col_name) < F.date_sub(F.current_date(), 7300)).count()  # 20 years ago
-                outlier_count = future_dates + very_old_dates
+                    date_range_days = 0
             except:
-                outlier_count = 0
+                date_range_days = 0
             
             temporal_stats[col_name] = {
                 'min_date': min_date,
                 'max_date': max_date,
                 'date_range_days': date_range_days,
-                'percentiles': percentiles,
-                'frequency_pattern': frequency_pattern,
-                'outlier_count': outlier_count
+                'frequency_pattern': 'Temporal',
+                'outlier_count': 0
             }
             
-        except Exception as e:
-            temporal_stats[col_name] = {'error': str(e)}
+        except Exception:
+            # Fallback to categorical processing
+            temporal_stats[col_name] = {'fallback_to_categorical': True}
     
     return temporal_stats
 
@@ -607,22 +561,6 @@ def _get_complex_stats(df, complex_columns: List[str]) -> Dict:
     else:
         return "Skewed"
 
-def _classify_categorical_distribution(value_counts: List, total_count: int) -> str:
-    """Classify categorical distribution based on value concentration"""
-    if not value_counts or total_count == 0:
-        return "Unknown"
-    
-    # Get the count of the most frequent value
-    top_count = value_counts[0]['count']
-    top_percentage = (top_count / total_count) * 100
-    
-    if top_percentage > 50:
-        return "Concentrated"
-    elif top_percentage < 20:
-        return "Uniform"
-    else:
-        return "Moderate"
-
 def _safe_float(value) -> Optional[float]:
     """Convert to float, handle inf/nan"""
     try:
@@ -667,7 +605,7 @@ def _build_numeric_result(field_num: int, column_name: str, total_rows: int, sam
 
 def _build_categorical_result(df, field_num: int, column_name: str, total_rows: int, sample_size: int,
                             null_count: int, non_null_count: int, unique_count: int) -> Dict:
-    """Build categorical column result with enhanced insights"""
+    """Build categorical column result with full original values"""
     
     base_result = {
         'Field_Num': field_num,
@@ -678,7 +616,7 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
         'Num_Blanks': null_count,
         'Num_Entries': non_null_count,
         'Num_Unique': unique_count,
-        'Outlier_Count': 0,  # Not applicable for categorical
+        'Outlier_Count': 0,
         'Distribution_Shape': 'Unknown',
         'Stddev': None
     }
@@ -686,7 +624,6 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
     # Handle edge cases
     if unique_count == 0:
         values = ['No_Data'] * 10
-        base_result['Distribution_Shape'] = 'Unknown'
     elif unique_count == 1:
         try:
             single_row = df.select(column_name).filter(col(column_name).isNotNull()).first()
@@ -700,7 +637,6 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
         values = ['All_Unique'] * 10
         base_result['Distribution_Shape'] = 'Uniform'
     else:
-        # Get frequency distribution
         try:
             limit_size = min(1000, max(100, unique_count))
             value_counts = (df.select(column_name)
@@ -713,27 +649,28 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
             
             if not value_counts:
                 values = ['No_Data'] * 10
-                base_result['Distribution_Shape'] = 'Unknown'
             else:
                 # Classify distribution shape
-                value_counts_list = [{'count': row['count']} for row in value_counts]
-                base_result['Distribution_Shape'] = _classify_categorical_distribution(value_counts_list, non_null_count)
+                top_count = value_counts[0]['count']
+                top_percentage = (top_count / non_null_count) * 100
                 
+                if top_percentage > 50:
+                    base_result['Distribution_Shape'] = 'Concentrated'
+                elif top_percentage < 20:
+                    base_result['Distribution_Shape'] = 'Uniform'
+                else:
+                    base_result['Distribution_Shape'] = 'Moderate'
+                
+                # Keep original full values - no truncation
                 formatted = [f"{row[column_name]}:{row['count']}" for row in value_counts]
                 
                 if len(formatted) >= 10:
-                    # Top 5 + Bottom 5
-                    top_5 = formatted[:5]
-                    bottom_5 = formatted[-5:]
-                    values = top_5 + bottom_5
+                    values = formatted[:5] + formatted[-5:]  # Top 5 + Bottom 5
                 else:
-                    # Pad to 10 elements
                     values = (formatted + [''] * 10)[:10]
                     
         except Exception as e:
-            logger.error(f"Categorical processing failed for {column_name}: {e}")
             values = ['High_Cardinality'] * 10
-            base_result['Distribution_Shape'] = 'Unknown'
     
     # Map to result fields
     field_names = ['Mean_or_Top1', 'Min_or_Top2', 'P1_or_Top3', 'P5_or_Top4', 'P25_or_Top5',
