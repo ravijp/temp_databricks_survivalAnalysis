@@ -8,9 +8,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-def _setup_logger():
+def _setup_logger(output_path = "/dbfs/tmp/edd"):
     """Setup clean file-only logger for audit trail"""
-    output_path = "/dbfs/tmp/edd"
     log_dir = os.path.join(output_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
@@ -34,8 +33,8 @@ logger = _setup_logger()
 
 def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                 filter_condition: Optional[str] = None, 
-                sample_threshold: int = 50_000_000) -> str:
-    """Generate EDD for single table"""
+                sample_threshold: int = 2_000_000) -> str:
+    """Generate EDD for single table with enhanced insights"""
     
     start_time = time.time()
     
@@ -49,7 +48,9 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     
     if sample_rate < 1.0:
         df = df.sample(sample_rate, seed=42)
-        total_rows = df.count()
+        actual_sample_size = df.count()
+    else:
+        actual_sample_size = total_rows
     
     df.cache()
     columns = df.columns
@@ -72,19 +73,20 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         try:
             null_count = null_counts[f"null_{col_name}"]
             unique_count = unique_counts[f"unique_{col_name}"]
-            non_null_count = total_rows - null_count
+            non_null_count = actual_sample_size - null_count
             
             if col_name in numeric_columns:
-                result = _build_numeric_result(i, col_name, null_count, non_null_count, 
-                                             unique_count, numeric_stats.get(col_name, {}))
+                result = _build_numeric_result(i, col_name, total_rows, actual_sample_size, 
+                                             null_count, non_null_count, unique_count, 
+                                             numeric_stats.get(col_name, {}))
             else:
-                result = _build_categorical_result(df, i, col_name, null_count, 
-                                                 non_null_count, unique_count)
+                result = _build_categorical_result(df, i, col_name, total_rows, actual_sample_size,
+                                                 null_count, non_null_count, unique_count)
             results.append(result)
             
         except Exception as e:
             logger.error(f"{table_name}.{col_name} failed: {e}")
-            results.append(_build_error_result(i, col_name, str(e)))
+            results.append(_build_error_result(i, col_name, total_rows, actual_sample_size, str(e)))
     
     df.unpersist()
     
@@ -115,7 +117,7 @@ def _classify_columns_by_schema(df) -> tuple[List[str], List[str]]:
     return numeric_cols, categorical_cols
 
 def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
-    """Get numeric statistics efficiently"""
+    """Get numeric statistics with outlier detection and distribution analysis"""
     if not numeric_columns:
         return {}
     
@@ -134,21 +136,82 @@ def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
         except:
             percentile_stats[col_name] = [None] * 7
     
-    # Combine results
+    # Outlier detection using IQR method
+    outlier_stats = {}
+    for col_name in numeric_columns:
+        try:
+            percentiles = percentile_stats.get(col_name, [None] * 7)
+            if percentiles[2] is not None and percentiles[4] is not None:  # Q1 and Q3
+                Q1, Q3 = percentiles[2], percentiles[4]
+                IQR = Q3 - Q1
+                if IQR > 0:
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+                    
+                    outlier_count = df.select(col_name).filter(
+                        (col(col_name) < lower_bound) | (col(col_name) > upper_bound)
+                    ).count()
+                    outlier_stats[col_name] = outlier_count
+                else:
+                    outlier_stats[col_name] = 0
+            else:
+                outlier_stats[col_name] = 0
+        except:
+            outlier_stats[col_name] = 0
+    
+    # Combine all statistics
     combined_stats = {}
     for col_name in numeric_columns:
         try:
+            mean_val = _safe_float(stats_pandas.loc['mean', col_name])
+            median_val = percentile_stats.get(col_name, [None] * 7)[3]  # Median is index 3
+            
             combined_stats[col_name] = {
-                'mean': _safe_float(stats_pandas.loc['mean', col_name]),
+                'mean': mean_val,
                 'stddev': _safe_float(stats_pandas.loc['stddev', col_name]),
                 'min': _safe_float(stats_pandas.loc['min', col_name]),
                 'max': _safe_float(stats_pandas.loc['max', col_name]),
-                'percentiles': percentile_stats.get(col_name, [None] * 7)
+                'median': _safe_float(median_val),
+                'percentiles': percentile_stats.get(col_name, [None] * 7),
+                'outlier_count': outlier_stats.get(col_name, 0),
+                'distribution_shape': _classify_numeric_distribution(mean_val, median_val)
             }
         except Exception as e:
             combined_stats[col_name] = {'error': str(e)}
     
     return combined_stats
+
+def _classify_numeric_distribution(mean: Optional[float], median: Optional[float]) -> str:
+    """Classify numeric distribution shape"""
+    if mean is None or median is None:
+        return "Unknown"
+    
+    if median == 0:
+        return "Skewed" if abs(mean) > 0.1 else "Normal"
+    
+    # Calculate relative difference
+    relative_diff = abs(mean - median) / abs(median)
+    
+    if relative_diff < 0.1:
+        return "Normal"
+    else:
+        return "Skewed"
+
+def _classify_categorical_distribution(value_counts: List, total_count: int) -> str:
+    """Classify categorical distribution based on value concentration"""
+    if not value_counts or total_count == 0:
+        return "Unknown"
+    
+    # Get the count of the most frequent value
+    top_count = value_counts[0]['count']
+    top_percentage = (top_count / total_count) * 100
+    
+    if top_percentage > 50:
+        return "Concentrated"
+    elif top_percentage < 20:
+        return "Uniform"
+    else:
+        return "Moderate"
 
 def _safe_float(value) -> Optional[float]:
     """Convert to float, handle inf/nan"""
@@ -160,47 +223,72 @@ def _safe_float(value) -> Optional[float]:
     except:
         return None
 
-def _build_numeric_result(field_num: int, column_name: str, null_count: int, 
-                         non_null_count: int, unique_count: int, stats: Dict) -> Dict:
-    """Build numeric column result"""
+def _build_numeric_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
+                         null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
+    """Build numeric column result with enhanced insights"""
     if 'error' in stats or not stats:
-        return _build_error_result(field_num, column_name, "Stats calculation failed")
+        return _build_error_result(field_num, column_name, total_rows, sample_size, "Stats calculation failed")
     
     percentiles = (stats.get('percentiles', []) + [None] * 7)[:7]
     
     return {
-        'Field_Num': field_num, 'Field_Name': column_name, 'Type': 'Numeric',
-        'Num_Blanks': null_count, 'Num_Entries': non_null_count, 'Num_Unique': unique_count,
-        'Stddev': stats.get('stddev'), 'Mean_or_Top1': stats.get('mean'),
-        'Min_or_Top2': stats.get('min'), 'P1_or_Top3': percentiles[0],
-        'P5_or_Top4': percentiles[1], 'P25_or_Top5': percentiles[2],
-        'Median_or_Bot5': percentiles[3], 'P75_or_Bot4': percentiles[4],
-        'P95_or_Bot3': percentiles[5], 'P99_or_Bot2': percentiles[6],
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Numeric',
+        'Total_Rows': total_rows,
+        'Sample_Size': sample_size,
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Outlier_Count': stats.get('outlier_count', 0),
+        'Distribution_Shape': stats.get('distribution_shape', 'Unknown'),
+        'Stddev': stats.get('stddev'),
+        'Mean_or_Top1': stats.get('mean'),
+        'Min_or_Top2': stats.get('min'),
+        'P1_or_Top3': percentiles[0],
+        'P5_or_Top4': percentiles[1],
+        'P25_or_Top5': percentiles[2],
+        'Median_or_Bot5': percentiles[3],
+        'P75_or_Bot4': percentiles[4],
+        'P95_or_Bot3': percentiles[5],
+        'P99_or_Bot2': percentiles[6],
         'Max_or_Bot1': stats.get('max')
     }
 
-def _build_categorical_result(df, field_num: int, column_name: str, null_count: int, 
-                            non_null_count: int, unique_count: int) -> Dict:
-    """Build categorical column result with top/bottom frequencies"""
+def _build_categorical_result(df, field_num: int, column_name: str, total_rows: int, sample_size: int,
+                            null_count: int, non_null_count: int, unique_count: int) -> Dict:
+    """Build categorical column result with enhanced insights"""
     
     base_result = {
-        'Field_Num': field_num, 'Field_Name': column_name, 'Type': 'Categorical',
-        'Num_Blanks': null_count, 'Num_Entries': non_null_count, 'Num_Unique': unique_count,
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Categorical',
+        'Total_Rows': total_rows,
+        'Sample_Size': sample_size,
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Outlier_Count': 0,  # Not applicable for categorical
+        'Distribution_Shape': 'Unknown',
         'Stddev': None
     }
     
     # Handle edge cases
     if unique_count == 0:
         values = ['No_Data'] * 10
+        base_result['Distribution_Shape'] = 'Unknown'
     elif unique_count == 1:
         try:
             single_row = df.select(column_name).filter(col(column_name).isNotNull()).first()
             single_val = f"{single_row[0]}:{non_null_count}" if single_row and single_row[0] is not None else 'All_Same'
             values = [single_val] * 10
+            base_result['Distribution_Shape'] = 'Concentrated'
         except:
             values = ['All_Same'] * 10
+            base_result['Distribution_Shape'] = 'Concentrated'
     elif unique_count == non_null_count:
         values = ['All_Unique'] * 10
+        base_result['Distribution_Shape'] = 'Uniform'
     else:
         # Get frequency distribution
         try:
@@ -215,7 +303,12 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
             
             if not value_counts:
                 values = ['No_Data'] * 10
+                base_result['Distribution_Shape'] = 'Unknown'
             else:
+                # Classify distribution shape
+                value_counts_list = [{'count': row['count']} for row in value_counts]
+                base_result['Distribution_Shape'] = _classify_categorical_distribution(value_counts_list, non_null_count)
+                
                 formatted = [f"{row[column_name]}:{row['count']}" for row in value_counts]
                 
                 if len(formatted) >= 10:
@@ -230,6 +323,7 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
         except Exception as e:
             logger.error(f"Categorical processing failed for {column_name}: {e}")
             values = ['High_Cardinality'] * 10
+            base_result['Distribution_Shape'] = 'Unknown'
     
     # Map to result fields
     field_names = ['Mean_or_Top1', 'Min_or_Top2', 'P1_or_Top3', 'P5_or_Top4', 'P25_or_Top5',
@@ -240,18 +334,34 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
     
     return base_result
 
-def _build_error_result(field_num: int, column_name: str, error_msg: str) -> Dict:
+def _build_error_result(field_num: int, column_name: str, total_rows: int, sample_size: int, error_msg: str) -> Dict:
     """Build error result for failed columns"""
     return {
-        'Field_Num': field_num, 'Field_Name': column_name, 'Type': 'Error',
-        'Num_Blanks': 0, 'Num_Entries': 0, 'Num_Unique': 0, 'Stddev': None,
-        'Mean_or_Top1': f'Error: {error_msg}', 'Min_or_Top2': None, 'P1_or_Top3': None,
-        'P5_or_Top4': None, 'P25_or_Top5': None, 'Median_or_Bot5': None,
-        'P75_or_Bot4': None, 'P95_or_Bot3': None, 'P99_or_Bot2': None, 'Max_or_Bot1': None
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Error',
+        'Total_Rows': total_rows,
+        'Sample_Size': sample_size,
+        'Num_Blanks': 0,
+        'Num_Entries': 0,
+        'Num_Unique': 0,
+        'Outlier_Count': 0,
+        'Distribution_Shape': 'Error',
+        'Stddev': None,
+        'Mean_or_Top1': f'Error: {error_msg}',
+        'Min_or_Top2': None,
+        'P1_or_Top3': None,
+        'P5_or_Top4': None,
+        'P25_or_Top5': None,
+        'Median_or_Bot5': None,
+        'P75_or_Bot4': None,
+        'P95_or_Bot3': None,
+        'P99_or_Bot2': None,
+        'Max_or_Bot1': None
     }
 
 def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
-              sample_threshold: int = 50_000_000) -> Dict[str, str]:
+              sample_threshold: int = 2_000_000) -> Dict[str, str]:
     """Process multiple tables"""
     
     print(f"Starting batch EDD: {len(table_list)} tables")
@@ -384,6 +494,7 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("EDD System Ready")
+    print("Enhanced EDD System Ready")
     print("Main: generate_edd(table) | batch_edd([tables])")  
     print("Utils: list_edd_files() | show_schema_classification(table) | view_log_file()")
+    print("Default sample: 2M rows | Enhanced with: Total_Rows, Sample_Size, Outlier_Count, Distribution_Shape")
