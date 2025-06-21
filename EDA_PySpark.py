@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 
 # Module level logger setup
 def _setup_module_logger():
-    """Set up module level logger"""
+    """Set up clean module level logger"""
     output_path = "/dbfs/tmp/edd"
     log_dir = os.path.join(output_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
@@ -23,20 +23,14 @@ def _setup_module_logger():
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     
-    # File handler
+    # Only file handler - no console duplication
     file_handler = logging.FileHandler(log_filepath)
     file_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', 
-                                datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     file_handler.setFormatter(formatter)
     
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter('%(message)s'))
-    
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    logger.propagate = False  # Prevent duplicate messages
     
     logger.info(f"EDD Module loaded. Log: {log_filepath}")
     return logger
@@ -51,14 +45,13 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     Fast EDD generation using pure schema-based type detection
     """
     
-    logger.info(f"Processing: {table_name}")
+    print(f"Processing: {table_name}")
     start_time = time.time()
     
     # Load and prepare data
     df = spark.table(table_name)
     if filter_condition:
         df = df.filter(filter_condition)
-        logger.info(f"Applied filter: {filter_condition}")
     
     # Get table size and determine strategy
     total_rows = df.count()
@@ -66,20 +59,19 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     
     if sample_rate < 1.0:
         df = df.sample(sample_rate, seed=42)
-        logger.info(f"Sampling {sample_rate:.3f} of {total_rows:,} rows")
+        print(f"Sampling {sample_rate:.3f} of {total_rows:,} rows")
         total_rows = df.count()
     
     df.cache()
     columns = df.columns
-    logger.info(f"Analyzing {total_rows:,} rows, {len(columns)} columns")
+    print(f"Analyzing {total_rows:,} rows, {len(columns)} columns")
     
     # Schema-based type detection
-    logger.info("Detecting column types from schema...")
     numeric_columns, categorical_columns = _classify_columns_by_schema(df)
-    logger.info(f"Numeric: {len(numeric_columns)}, Categorical: {len(categorical_columns)}")
+    print(f"Numeric: {len(numeric_columns)}, Categorical: {len(categorical_columns)}")
     
     # Batch operations for basic statistics
-    logger.info("Computing basic statistics...")
+    print("Computing statistics...")
     
     # Batch null counts for all columns
     null_exprs = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
@@ -92,11 +84,9 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     # Batch numeric statistics
     numeric_stats = {}
     if numeric_columns:
-        logger.info(f"Computing numeric statistics for {len(numeric_columns)} columns...")
         numeric_stats = _get_batch_numeric_stats(df, numeric_columns)
     
     # Process results
-    logger.info("Building results...")
     results = []
     
     for i, column_name in enumerate(columns, 1):
@@ -115,7 +105,7 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
             results.append(result)
             
         except Exception as e:
-            logger.error(f"ERROR processing column {column_name}: {e}")
+            logger.error(f"Column {column_name}: {e}")
             # Add error result and continue
             error_result = {
                 'Field_Num': i, 'Field_Name': column_name, 'Type': 'Error',
@@ -138,10 +128,11 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     try:
         pd.DataFrame(results).to_csv(filepath, index=False)
         elapsed = (time.time() - start_time) / 60
-        logger.info(f"EDD completed in {elapsed:.1f} minutes: {filepath}")
+        print(f"EDD completed in {elapsed:.1f} minutes: {os.path.basename(filepath)}")
+        logger.info(f"{table_name} - {total_rows:,} rows, {len(columns)} cols - {elapsed:.1f}min - {os.path.basename(filepath)}")
         return filepath
     except Exception as e:
-        logger.error(f"Failed to save EDD file: {e}")
+        logger.error(f"Failed to save {table_name}: {e}")
         raise
 
 def _classify_columns_by_schema(df) -> tuple[List[str], List[str]]:
@@ -379,16 +370,17 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
 
 def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
               sample_threshold: int = 50_000_000) -> Dict[str, str]:
-    """Process multiple tables with module logger"""
+    """Process multiple tables with clean logging"""
     
-    logger.info(f"Starting batch EDD for {len(table_list)} tables")
+    print(f"Starting batch EDD for {len(table_list)} tables")
+    logger.info(f"Batch started: {len(table_list)} tables")
     batch_start = time.time()
     
     results = {}
     summary_data = []
     
     for i, table_name in enumerate(table_list, 1):
-        logger.info(f"\n[{i}/{len(table_list)}] {table_name}")
+        print(f"\n[{i}/{len(table_list)}] {table_name}")
         
         try:
             start_time = time.time()
@@ -403,12 +395,11 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
                 'Processing_Time_Minutes': round(elapsed / 60, 2)
             })
             
-            logger.info(f"  -> SUCCESS: {filepath} ({elapsed/60:.1f} min)")
-            
         except Exception as e:
-            error_msg = f"ERROR: {str(e)}"
+            error_msg = f"FAILED: {str(e)}"
             results[table_name] = error_msg
-            logger.error(f"  -> FAILED: {error_msg}")
+            print(f"  -> {error_msg}")
+            logger.error(f"{table_name} - FAILED: {e}")
             
             summary_data.append({
                 'Table_Name': table_name,
@@ -418,30 +409,30 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
                 'Error': str(e)
             })
     
-    # Generate batch summary with error handling
+    # Generate batch summary
     now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     summary_file = os.path.join(output_path, f"batch_summary_{timestamp}.csv")
     
     try:
         pd.DataFrame(summary_data).to_csv(summary_file, index=False)
-        logger.info(f"Summary saved: {summary_file}")
     except Exception as e:
-        logger.error(f"Failed to save summary file: {e}")
+        logger.error(f"Failed to save summary: {e}")
     
     successful = sum(1 for r in results.values() if r.endswith('.csv'))
     total_time = (time.time() - batch_start) / 60
     
-    logger.info(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_time:.1f} minutes")
+    print(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_time:.1f} minutes")
+    logger.info(f"Batch completed: {successful}/{len(table_list)} successful in {total_time:.1f}min")
     
     return results
 
 # Helper functions for file management
 def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
-    """List all EDD files and single log file"""
+    """List EDD files and log"""
     try:
         if not os.path.exists(output_path):
-            print(f"Directory {output_path} does not exist")
+            print("No EDD directory found")
             return
             
         # EDD files
@@ -450,16 +441,16 @@ def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
             print(f"EDD files ({len(files)}):")
             for i, filename in enumerate(files, 1):
                 size_mb = os.path.getsize(os.path.join(output_path, filename)) / (1024*1024)
-                print(f"{i:2d}. {filename} ({size_mb:.2f} MB)")
+                print(f"{i:2d}. {filename} ({size_mb:.1f}MB)")
         else:
             print("No EDD files found")
             
-        # Single log file
+        # Log file
         logs_dir = os.path.join(output_path, "logs")
         if os.path.exists(logs_dir):
             log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
             if log_files:
-                print(f"\nBatch log: {log_files[-1]} (use view_log_file() to see details)")
+                print(f"\nBatch log: {log_files[-1]} (use view_log_file())")
         
         print(f"\nDownload: Data → DBFS → tmp → edd")
         
@@ -504,11 +495,11 @@ def show_schema_classification(table_name: str) -> None:
         print(f"  {col_name} ({col_type})")
 
 def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
-    """Display the single batch log file"""
+    """Display the clean batch log file"""
     
     logs_dir = os.path.join(output_path, "logs")
     if not os.path.exists(logs_dir):
-        print(f"No logs directory found at {logs_dir}")
+        print(f"No logs directory found")
         return
     
     log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
@@ -522,17 +513,17 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
     log_filepath = os.path.join(logs_dir, log_filename)
     
     try:
-        print(f"Displaying log: {log_filename}")
-        print("-" * 80)
+        print(f"Log: {log_filename}")
+        print("-" * 50)
         with open(log_filepath, 'r') as f:
             print(f.read())
-        print("-" * 80)
+        print("-" * 50)
     except Exception as e:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("EDD System Ready (module logger initialized):")
+    print("EDD System Ready:")
     print("- generate_edd(table_name)  |  batch_edd(table_list)")  
     print("- list_edd_files()  |  view_log_file()")
     print("- show_schema_classification(table_name)")
-    print("Log file created on module import - ready to use!")
+    print("Clean logging: Console shows progress, file logs essentials")
