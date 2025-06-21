@@ -9,26 +9,38 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
 def _setup_logger():
-    """Setup clean file-only logger for audit trail"""
-    output_path = "/dbfs/tmp/edd"
-    log_dir = os.path.join(output_path, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    
-    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"edd_batch_{timestamp}.log")
-    
-    logger = logging.getLogger("edd_batch")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    
-    handler = logging.FileHandler(log_file)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
-    logger.addHandler(handler)
-    logger.propagate = False
-    
-    logger.info(f"EDD Module loaded. Log: {log_file}")
-    return logger
+    """Setup file-only logger for audit trail"""
+    try:
+        output_path = "/dbfs/tmp/edd"
+        log_dir = os.path.join(output_path, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"edd_batch_{timestamp}.log")
+        
+        logger = logging.getLogger("edd_batch")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        
+        handler = logging.FileHandler(log_file)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
+        logger.addHandler(handler)
+        logger.propagate = False
+        
+        logger.info(f"EDD Module loaded. Log: {log_file}")
+        return logger
+        
+    except Exception as e:
+        # Fallback to console logger
+        logger = logging.getLogger("edd_batch")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
+        logger.addHandler(console_handler)
+        logger.warning(f"File logging failed, using console: {e}")
+        return logger
 
 logger = _setup_logger()
 
@@ -76,8 +88,18 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     df_to_analyze.cache()
     columns = df_to_analyze.columns
     
-    # Schema classification
-    numeric_columns, categorical_columns = _classify_columns_by_schema(df_to_analyze)
+    # Schema classification - now returns 5 types
+    numeric_columns, categorical_columns, temporal_columns, boolean_columns, complex_columns = _classify_columns_by_schema(df_to_analyze)
+    
+    # Print column type summary
+    type_summary = f"Column types: {len(numeric_columns)} Numeric, {len(categorical_columns)} Categorical"
+    if temporal_columns:
+        type_summary += f", {len(temporal_columns)} Temporal"
+    if boolean_columns:
+        type_summary += f", {len(boolean_columns)} Boolean"  
+    if complex_columns:
+        type_summary += f", {len(complex_columns)} Complex"
+    print(f"  → {type_summary}")
     
     # Batch statistics
     null_exprs = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
@@ -86,28 +108,63 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     unique_exprs = [approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns]
     unique_counts = df_to_analyze.select(unique_exprs).collect()[0].asDict()
     
+    # Get statistics for each column type
     numeric_stats = _get_batch_numeric_stats(df_to_analyze, numeric_columns) if numeric_columns else {}
+    temporal_stats = _get_temporal_stats(df_to_analyze, temporal_columns) if temporal_columns else {}
+    boolean_stats = _get_boolean_stats(df_to_analyze, boolean_columns) if boolean_columns else {}
+    complex_stats = _get_complex_stats(df_to_analyze, complex_columns) if complex_columns else {}
     
-    # Build results
+    # Build results - ensure every column is processed
     results = []
+    processed_columns = set()
+    
     for i, col_name in enumerate(columns, 1):
         try:
             null_count = null_counts[f"null_{col_name}"]
             unique_count = unique_counts[f"unique_{col_name}"]
             non_null_count = actual_sample_size - null_count
             
+            # Route to appropriate result builder based on column type
             if col_name in numeric_columns:
                 result = _build_numeric_result(i, col_name, total_rows, actual_sample_size, 
                                              null_count, non_null_count, unique_count, 
                                              numeric_stats.get(col_name, {}))
+            elif col_name in temporal_columns:
+                result = _build_temporal_result(i, col_name, total_rows, actual_sample_size,
+                                              null_count, non_null_count, unique_count,
+                                              temporal_stats.get(col_name, {}))
+            elif col_name in boolean_columns:
+                result = _build_boolean_result(i, col_name, total_rows, actual_sample_size,
+                                             null_count, non_null_count, unique_count,
+                                             boolean_stats.get(col_name, {}))
+            elif col_name in complex_columns:
+                result = _build_complex_result(i, col_name, total_rows, actual_sample_size,
+                                             null_count, non_null_count, unique_count,
+                                             complex_stats.get(col_name, {}))
             else:
+                # Default to categorical for any unclassified columns
                 result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, actual_sample_size,
                                                  null_count, non_null_count, unique_count)
+            
             results.append(result)
+            processed_columns.add(col_name)
             
         except Exception as e:
+            # Ensure failed columns still appear in output
             logger.error(f"{table_name}.{col_name} failed: {e}")
-            results.append(_build_error_result(i, col_name, total_rows, actual_sample_size, str(e)))
+            error_result = _build_error_result(i, col_name, total_rows, actual_sample_size, str(e))
+            results.append(error_result)
+            processed_columns.add(col_name)
+    
+    # Check for any missed columns
+    missing_columns = set(columns) - processed_columns
+    if missing_columns:
+        logger.error(f"Missing columns: {missing_columns}")
+        for missed_col in missing_columns:
+            col_index = columns.index(missed_col) + 1
+            error_result = _build_error_result(col_index, missed_col, total_rows, actual_sample_size, 
+                                             "Column missed in processing")
+            results.append(error_result)
     
     df_to_analyze.unpersist()
     
@@ -130,12 +187,34 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         logger.error(f"{table_name} save failed: {e}")
         raise
 
-def _classify_columns_by_schema(df) -> tuple[List[str], List[str]]:
-    """Classify columns by Spark schema types"""
+def _classify_columns_by_schema(df) -> tuple[List[str], List[str], List[str], List[str], List[str]]:
+    """Classify columns by Spark schema types into 5 categories"""
     numeric_types = {IntegerType, LongType, FloatType, DoubleType, DecimalType, ByteType, ShortType}
-    numeric_cols = [f.name for f in df.schema.fields if type(f.dataType) in numeric_types]
-    categorical_cols = [f.name for f in df.schema.fields if type(f.dataType) not in numeric_types]
-    return numeric_cols, categorical_cols
+    temporal_types = {DateType, TimestampType}
+    boolean_types = {BooleanType}
+    complex_types = {ArrayType, MapType, StructType, NullType}
+    
+    numeric_cols = []
+    categorical_cols = []
+    temporal_cols = []
+    boolean_cols = []
+    complex_cols = []
+    
+    for field in df.schema.fields:
+        field_type = type(field.dataType)
+        
+        if field_type in numeric_types:
+            numeric_cols.append(field.name)
+        elif field_type in temporal_types:
+            temporal_cols.append(field.name)
+        elif field_type in boolean_types:
+            boolean_cols.append(field.name)
+        elif field_type in complex_types:
+            complex_cols.append(field.name)
+        else:
+            categorical_cols.append(field.name)
+    
+    return numeric_cols, categorical_cols, temporal_cols, boolean_cols, complex_cols
 
 def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
     """Get numeric statistics with outlier detection and distribution analysis"""
@@ -201,8 +280,318 @@ def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
             combined_stats[col_name] = {'error': str(e)}
     
     return combined_stats
-
+    
 def _classify_numeric_distribution(mean: Optional[float], median: Optional[float]) -> str:
+    """Classify numeric distribution shape"""
+    if mean is None or median is None:
+        return "Unknown"
+    
+    if median == 0:
+        return "Skewed" if abs(mean) > 0.1 else "Normal"
+    
+    # Calculate relative difference
+    relative_diff = abs(mean - median) / abs(median)
+    
+    if relative_diff < 0.1:
+        return "Normal"
+    else:
+        return "Skewed"
+
+def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
+                          null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
+    """Build temporal column result with date-specific insights"""
+    if 'error' in stats or not stats:
+        return _build_error_result(field_num, column_name, total_rows, sample_size, "Temporal stats calculation failed")
+    
+    # Format dates as strings for CSV output
+    min_date = str(stats.get('min_date', '')) if stats.get('min_date') else ''
+    max_date = str(stats.get('max_date', '')) if stats.get('max_date') else ''
+    
+    # Get percentiles (may be None)
+    percentiles = stats.get('percentiles', [None] * 7)
+    percentile_strs = []
+    for p in percentiles:
+        if p is not None:
+            percentile_strs.append(str(p))
+        else:
+            percentile_strs.append('')
+    
+    # Pad to ensure 7 elements
+    percentile_strs = (percentile_strs + [''] * 7)[:7]
+    
+    # Use median date or most common pattern as "mean"
+    median_date = percentile_strs[3] if len(percentile_strs) > 3 else ''
+    mean_or_pattern = median_date if median_date else stats.get('frequency_pattern', 'Unknown')
+    
+    return {
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Temporal',
+        'Total_Rows': total_rows,
+        'Sample_Size': sample_size,
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Outlier_Count': stats.get('outlier_count', 0),
+        'Distribution_Shape': stats.get('frequency_pattern', 'Unknown'),
+        'Stddev': stats.get('date_range_days', 0),  # Date range as "spread"
+        'Mean_or_Top1': mean_or_pattern,
+        'Min_or_Top2': min_date,
+        'P1_or_Top3': percentile_strs[0],
+        'P5_or_Top4': percentile_strs[1],
+        'P25_or_Top5': percentile_strs[2],
+        'Median_or_Bot5': percentile_strs[3],
+        'P75_or_Bot4': percentile_strs[4],
+        'P95_or_Bot3': percentile_strs[5],
+        'P99_or_Bot2': percentile_strs[6],
+        'Max_or_Bot1': max_date
+    }
+
+def _build_boolean_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
+                         null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
+    """Build boolean column result with binary insights"""
+    if 'error' in stats or not stats:
+        return _build_error_result(field_num, column_name, total_rows, sample_size, "Boolean stats calculation failed")
+    
+    percentiles = (stats.get('percentiles', []) + [0] * 7)[:7]
+    true_pct = stats.get('true_percentage', 0.0)
+    
+    return {
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Boolean',
+        'Total_Rows': total_rows,
+        'Sample_Size': sample_size,
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Outlier_Count': 0,  # Not applicable for boolean
+        'Distribution_Shape': stats.get('distribution_shape', 'Unknown'),
+        'Stddev': stats.get('stddev'),
+        'Mean_or_Top1': round(true_pct, 4),  # True percentage
+        'Min_or_Top2': stats.get('min', 0),
+        'P1_or_Top3': percentiles[0],
+        'P5_or_Top4': percentiles[1],
+        'P25_or_Top5': percentiles[2],
+        'Median_or_Bot5': percentiles[3],
+        'P75_or_Bot4': percentiles[4],
+        'P95_or_Bot3': percentiles[5],
+        'P99_or_Bot2': percentiles[6],
+        'Max_or_Bot1': stats.get('max', 1)
+    }
+
+def _build_complex_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
+                         null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
+    """Build complex column result with minimal analysis"""
+    if 'error' in stats or not stats:
+        return _build_error_result(field_num, column_name, total_rows, sample_size, "Complex stats calculation failed")
+    
+    avg_size = stats.get('avg_structure_size', 0)
+    max_size = stats.get('max_structure_size', 0)
+    
+    return {
+        'Field_Num': field_num,
+        'Field_Name': column_name,
+        'Type': 'Complex',
+        'Total_Rows': total_rows,
+        'Sample_Size': sample_size,
+        'Num_Blanks': null_count,
+        'Num_Entries': non_null_count,
+        'Num_Unique': unique_count,
+        'Outlier_Count': 0,  # Not applicable for complex
+        'Distribution_Shape': 'Complex',
+        'Stddev': None,
+        'Mean_or_Top1': 'Complex_Analysis_Required',
+        'Min_or_Top2': round(avg_size, 2) if avg_size > 0 else 'N/A',
+        'P1_or_Top3': None,
+        'P5_or_Top4': None,
+        'P25_or_Top5': None,
+        'Median_or_Bot5': None,
+        'P75_or_Bot4': None,
+        'P95_or_Bot3': None,
+        'P99_or_Bot2': None,
+        'Max_or_Bot1': round(max_size, 2) if max_size > 0 else 'N/A'
+    }
+
+def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
+    """Get temporal statistics for date/timestamp columns"""
+    if not temporal_columns:
+        return {}
+    
+    temporal_stats = {}
+    
+    for col_name in temporal_columns:
+        try:
+            # Convert to unix timestamp for percentile calculations
+            temp_df = df.select(col_name).filter(col(col_name).isNotNull())
+            
+            # Get min/max dates
+            min_max = temp_df.agg(
+                F.min(col_name).alias('min_date'),
+                F.max(col_name).alias('max_date')
+            ).collect()[0]
+            
+            min_date = min_max['min_date']
+            max_date = min_max['max_date']
+            
+            # Calculate date range in days
+            if min_date and max_date:
+                date_range_days = (max_date - min_date).days if hasattr((max_date - min_date), 'days') else 0
+            else:
+                date_range_days = 0
+            
+            # Get percentiles using unix timestamp
+            percentile_values = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]
+            try:
+                percentile_df = temp_df.select(F.unix_timestamp(col_name).alias('unix_ts'))
+                percentiles_unix = percentile_df.approxQuantile('unix_ts', percentile_values, 0.01)
+                
+                # Convert back to dates
+                percentiles = []
+                for ts in percentiles_unix:
+                    if ts is not None:
+                        percentiles.append(F.from_unixtime(ts).cast('date'))
+                    else:
+                        percentiles.append(None)
+            except:
+                percentiles = [None] * 7
+            
+            # Determine frequency pattern
+            unique_dates = temp_df.approxCountDistinct().collect()[0][0]
+            total_records = temp_df.count()
+            
+            if unique_dates == total_records:
+                frequency_pattern = "Unique_Timestamps"
+            elif date_range_days > 0:
+                avg_records_per_day = total_records / date_range_days
+                if avg_records_per_day >= 50:
+                    frequency_pattern = "Multiple_Daily"
+                elif avg_records_per_day >= 5:
+                    frequency_pattern = "Daily"
+                elif avg_records_per_day >= 0.5:
+                    frequency_pattern = "Weekly"
+                else:
+                    frequency_pattern = "Monthly_Sparse"
+            else:
+                frequency_pattern = "Single_Date"
+            
+            # Simple outlier detection for dates (future dates or very old dates)
+            outlier_count = 0
+            try:
+                future_dates = df.select(col_name).filter(col(col_name) > F.current_date()).count()
+                very_old_dates = df.select(col_name).filter(col(col_name) < F.date_sub(F.current_date(), 7300)).count()  # 20 years ago
+                outlier_count = future_dates + very_old_dates
+            except:
+                outlier_count = 0
+            
+            temporal_stats[col_name] = {
+                'min_date': min_date,
+                'max_date': max_date,
+                'date_range_days': date_range_days,
+                'percentiles': percentiles,
+                'frequency_pattern': frequency_pattern,
+                'outlier_count': outlier_count
+            }
+            
+        except Exception as e:
+            temporal_stats[col_name] = {'error': str(e)}
+    
+    return temporal_stats
+
+def _get_boolean_stats(df, boolean_columns: List[str]) -> Dict:
+    """Get boolean statistics treating as 0/1 numeric"""
+    if not boolean_columns:
+        return {}
+    
+    boolean_stats = {}
+    
+    for col_name in boolean_columns:
+        try:
+            # Convert boolean to 0/1 and get statistics
+            bool_df = df.select(col_name).filter(col(col_name).isNotNull())
+            
+            # Get basic stats
+            stats = bool_df.select(
+                F.mean(col(col_name).cast('int')).alias('mean'),
+                F.stddev(col(col_name).cast('int')).alias('stddev'),
+                F.min(col(col_name).cast('int')).alias('min'),
+                F.max(col(col_name).cast('int')).alias('max')
+            ).collect()[0]
+            
+            mean_val = float(stats['mean']) if stats['mean'] is not None else None
+            true_percentage = mean_val if mean_val is not None else 0.0
+            
+            # Determine distribution shape
+            if true_percentage < 0.1:
+                distribution_shape = "Skewed_False"
+            elif true_percentage > 0.9:
+                distribution_shape = "Skewed_True"
+            else:
+                distribution_shape = "Balanced"
+            
+            # Get percentiles (will be 0s and 1s)
+            percentiles = [0, 0, 0, 0, 1, 1, 1] if true_percentage > 0.5 else [0, 0, 0, 0, 0, 0, 1]
+            
+            boolean_stats[col_name] = {
+                'mean': mean_val,
+                'stddev': _safe_float(stats['stddev']),
+                'min': int(stats['min']) if stats['min'] is not None else 0,
+                'max': int(stats['max']) if stats['max'] is not None else 1,
+                'true_percentage': true_percentage,
+                'percentiles': percentiles,
+                'distribution_shape': distribution_shape,
+                'outlier_count': 0  # Not applicable for boolean
+            }
+            
+        except Exception as e:
+            boolean_stats[col_name] = {'error': str(e)}
+    
+    return boolean_stats
+
+def _get_complex_stats(df, complex_columns: List[str]) -> Dict:
+    """Get minimal statistics for complex columns (arrays, maps, structs)"""
+    if not complex_columns:
+        return {}
+    
+    complex_stats = {}
+    
+    for col_name in complex_columns:
+        try:
+            # Basic analysis for complex types
+            non_null_df = df.select(col_name).filter(col(col_name).isNotNull())
+            
+            # Try to get size information for arrays/maps
+            try:
+                if 'array' in str(df.select(col_name).dtypes[0][1]).lower():
+                    # Array type - get size distribution
+                    size_stats = non_null_df.select(F.size(col_name).alias('array_size')).describe().collect()
+                    avg_size = float([row['array_size'] for row in size_stats if row['summary'] == 'mean'][0])
+                    max_size = float([row['array_size'] for row in size_stats if row['summary'] == 'max'][0])
+                elif 'map' in str(df.select(col_name).dtypes[0][1]).lower():
+                    # Map type - get size distribution
+                    size_stats = non_null_df.select(F.size(col_name).alias('map_size')).describe().collect()
+                    avg_size = float([row['map_size'] for row in size_stats if row['summary'] == 'mean'][0])
+                    max_size = float([row['map_size'] for row in size_stats if row['summary'] == 'max'][0])
+                else:
+                    # Struct or other complex type
+                    avg_size = 1.0
+                    max_size = 1.0
+            except:
+                avg_size = 0.0
+                max_size = 0.0
+            
+            complex_stats[col_name] = {
+                'avg_structure_size': avg_size,
+                'max_structure_size': max_size,
+                'analysis_type': 'Complex',
+                'outlier_count': 0,
+                'distribution_shape': 'Complex'
+            }
+            
+        except Exception as e:
+            complex_stats[col_name] = {'error': str(e)}
+    
+    return complex_stats
     """Classify numeric distribution shape"""
     if mean is None or median is None:
         return "Unknown"
@@ -469,29 +858,30 @@ def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error: {e}")
 
 def show_schema_classification(table_name: str) -> None:
-    """Preview column type classification"""
+    """Preview column type classification with enhanced 5-type system"""
     df = spark.table(table_name)
-    numeric_cols, categorical_cols = _classify_columns_by_schema(df)
+    numeric_cols, categorical_cols, temporal_cols, boolean_cols, complex_cols = _classify_columns_by_schema(df)
     
+    total_cols = len(df.columns)
     print(f"Schema classification: {table_name}")
-    print(f"Total: {len(df.columns)} | Numeric: {len(numeric_cols)} | Categorical: {len(categorical_cols)}")
-    print("-" * 60)
+    print(f"Total: {total_cols} columns")
+    print(f"Numeric: {len(numeric_cols)}, Categorical: {len(categorical_cols)}, Temporal: {len(temporal_cols)}, Boolean: {len(boolean_cols)}, Complex: {len(complex_cols)}")
+    print("-" * 80)
     
-    if numeric_cols:
-        print(f"NUMERIC ({len(numeric_cols)}):")
-        for col_name in numeric_cols[:10]:  # Show first 10
-            col_type = dict(df.dtypes)[col_name]
-            print(f"  {col_name} ({col_type})")
-        if len(numeric_cols) > 10:
-            print(f"  ... and {len(numeric_cols) - 10} more")
+    def show_columns(cols, type_name):
+        if cols:
+            print(f"\n{type_name.upper()} ({len(cols)}):")
+            for col_name in cols[:10]:
+                col_type = dict(df.dtypes)[col_name]
+                print(f"  {col_name} ({col_type})")
+            if len(cols) > 10:
+                print(f"  ... and {len(cols) - 10} more")
     
-    if categorical_cols:
-        print(f"\nCATEGORICAL ({len(categorical_cols)}):")
-        for col_name in categorical_cols[:10]:  # Show first 10
-            col_type = dict(df.dtypes)[col_name]
-            print(f"  {col_name} ({col_type})")
-        if len(categorical_cols) > 10:
-            print(f"  ... and {len(categorical_cols) - 10} more")
+    show_columns(numeric_cols, "Numeric")
+    show_columns(categorical_cols, "Categorical")  
+    show_columns(temporal_cols, "Temporal")
+    show_columns(boolean_cols, "Boolean")
+    show_columns(complex_cols, "Complex")
 
 def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
     """Display latest log file"""
@@ -516,7 +906,8 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("Enhanced EDD System Ready - Three-Tier Sampling Strategy")
+    print("Enhanced EDD System v9 Ready")
+    print("Column Types: Numeric | Categorical | Temporal | Boolean | Complex")
     print("Sampling: ≤2M=Full Data | 2M-20M=Random Sample | 20M+=TABLESAMPLE")
     print("Main: generate_edd(table) | batch_edd([tables])")  
     print("Utils: list_edd_files() | show_schema_classification(table) | view_log_file()")
