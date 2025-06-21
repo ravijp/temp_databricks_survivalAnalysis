@@ -14,18 +14,20 @@ def _setup_logger():
     log_dir = os.path.join(output_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
-    timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"edd_batch_{timestamp}.log")
     
-    logger = logging.getLogger("edd_audit")
+    logger = logging.getLogger("edd_batch")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     
     handler = logging.FileHandler(log_file)
-    handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
     logger.addHandler(handler)
     logger.propagate = False
     
+    logger.info(f"EDD Module loaded. Log: {log_file}")
     return logger
 
 logger = _setup_logger()
