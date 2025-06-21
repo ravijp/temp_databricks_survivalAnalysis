@@ -8,28 +8,24 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-def setup_logger(output_path: str) -> logging.Logger:
-    """Set up single logger for entire batch process"""
-    
-    # Create logs directory
+# Module level logger setup
+def _setup_module_logger():
+    """Set up module level logger"""
+    output_path = "/dbfs/tmp/edd"
     log_dir = os.path.join(output_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
-    # Single log file for everything
     now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     log_filepath = os.path.join(log_dir, f"edd_batch_{timestamp}.log")
     
-    # Single logger
     logger = logging.getLogger("edd_batch")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     
-    # File handler with IST timestamps
+    # File handler
     file_handler = logging.FileHandler(log_filepath)
     file_handler.setLevel(logging.INFO)
-    
-    # Simple formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', 
                                 datefmt='%Y-%m-%d %H:%M:%S')
     file_handler.setFormatter(formatter)
@@ -42,8 +38,11 @@ def setup_logger(output_path: str) -> logging.Logger:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
-    logger.info(f"EDD Batch started. Log: {log_filepath}")
+    logger.info(f"EDD Module loaded. Log: {log_filepath}")
     return logger
+
+# Initialize module logger
+logger = _setup_module_logger()
 
 def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                 filter_condition: Optional[str] = None, 
@@ -52,7 +51,6 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     Fast EDD generation using pure schema-based type detection
     """
     
-    logger = logging.getLogger("edd_batch")
     logger.info(f"Processing: {table_name}")
     start_time = time.time()
     
@@ -381,10 +379,8 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
 
 def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
               sample_threshold: int = 50_000_000) -> Dict[str, str]:
-    """Process multiple tables with single logger"""
+    """Process multiple tables with module logger"""
     
-    # Set up single logger for entire batch
-    logger = setup_logger(output_path)
     logger.info(f"Starting batch EDD for {len(table_list)} tables")
     batch_start = time.time()
     
@@ -437,7 +433,6 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
     total_time = (time.time() - batch_start) / 60
     
     logger.info(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_time:.1f} minutes")
-    logger.info(f"Single log file saved in: {output_path}/logs/")
     
     return results
 
@@ -536,8 +531,8 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("EDD System Ready:")
+    print("EDD System Ready (module logger initialized):")
     print("- generate_edd(table_name)  |  batch_edd(table_list)")  
     print("- list_edd_files()  |  view_log_file()")
     print("- show_schema_classification(table_name)")
-    print("Single log file captures all processing details")
+    print("Log file created on module import - ready to use!")
