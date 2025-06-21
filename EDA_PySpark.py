@@ -61,18 +61,65 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     results = []
     
     for i, column_name in enumerate(columns, 1):
-        null_count = null_counts[f"null_{column_name}"]
-        unique_count = unique_counts[f"unique_{column_name}"]
-        non_null_count = total_rows - null_count
-        
-        if column_name in numeric_columns:
-            result = _build_numeric_result(i, column_name, null_count, non_null_count, 
-                                         unique_count, numeric_stats.get(column_name, {}))
-        else:
-            result = _build_categorical_result(df, i, column_name, null_count, 
-                                             non_null_count, unique_count)
-        
-        results.append(result)
+        try:
+            print(f"Processing column {i}/{len(columns)}: {column_name}")
+            
+            # Check if keys exist in dictionaries
+            null_key = f"null_{column_name}"
+            unique_key = f"unique_{column_name}"
+            
+            if null_key not in null_counts:
+                print(f"WARNING: Missing null count for {column_name}")
+                null_count = 0
+            else:
+                null_count = null_counts[null_key]
+                
+            if unique_key not in unique_counts:
+                print(f"WARNING: Missing unique count for {column_name}")
+                unique_count = 0
+            else:
+                unique_count = unique_counts[unique_key]
+                
+            non_null_count = total_rows - null_count
+            
+            if column_name in numeric_columns:
+                print(f"  -> Processing as NUMERIC")
+                result = _build_numeric_result(i, column_name, null_count, non_null_count, 
+                                             unique_count, numeric_stats.get(column_name, {}))
+            else:
+                print(f"  -> Processing as CATEGORICAL")
+                result = _build_categorical_result(df, i, column_name, null_count, 
+                                                 non_null_count, unique_count)
+            
+            results.append(result)
+            print(f"  -> SUCCESS")
+            
+        except Exception as e:
+            print(f"ERROR processing column {column_name}: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add a basic error result so processing continues
+            error_result = {
+                'Field_Num': i,
+                'Field_Name': column_name,
+                'Type': 'Error',
+                'Num_Blanks': 0,
+                'Num_Entries': 0,
+                'Num_Unique': 0,
+                'Stddev': None,
+                'Mean_or_Top1': f'Error: {str(e)}',
+                'Min_or_Top2': None,
+                'P1_or_Top3': None,
+                'P5_or_Top4': None,
+                'P25_or_Top5': None,
+                'Median_or_Bot5': None,
+                'P75_or_Bot4': None,
+                'P95_or_Bot3': None,
+                'P99_or_Bot2': None,
+                'Max_or_Bot1': None
+            }
+            results.append(error_result)
     
     df.unpersist()
     
@@ -188,6 +235,8 @@ def _build_numeric_result(field_num: int, column_name: str, null_count: int,
         }
     
     percentiles = stats.get('percentiles', [None] * 7)
+    # Ensure percentiles array has exactly 7 elements with safe access
+    percentiles = (percentiles + [None] * 7)[:7]
     
     return {
         'Field_Num': field_num,
@@ -257,6 +306,10 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
                     top_5 = formatted_values[:5]      # Most frequent (highest counts)
                     bottom_5 = formatted_values[-5:]  # Least frequent (lowest counts)
                     
+                    # Ensure we have exactly 5 elements in each array with safe access
+                    top_5 = (top_5 + [''] * 5)[:5]
+                    bottom_5 = (bottom_5 + [''] * 5)[:5]
+                    
                     return {
                         'Field_Num': field_num,
                         'Field_Name': column_name,
@@ -271,7 +324,7 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
                         'P1_or_Top3': top_5[2],
                         'P5_or_Top4': top_5[3],
                         'P25_or_Top5': top_5[4],
-                        # BOTTOM 5 - Least frequent values  
+                        # BOTTOM 5 - Least frequent values (reversed for proper order)
                         'Median_or_Bot5': bottom_5[0],  # 5th from bottom
                         'P75_or_Bot4': bottom_5[1],     # 4th from bottom
                         'P95_or_Bot3': bottom_5[2],     # 3rd from bottom
