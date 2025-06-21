@@ -4,22 +4,78 @@ from pyspark.sql.types import *
 import pandas as pd
 import os
 import time
+import logging
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
+def setup_logger(output_path: str, table_name: str = None) -> logging.Logger:
+    """Set up logger to save all output to file"""
+    
+    # Create logs directory
+    log_dir = os.path.join(output_path, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create log filename
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if table_name:
+        log_filename = f"edd_{table_name.replace('.', '_')}_{timestamp}.log"
+    else:
+        log_filename = f"edd_batch_{timestamp}.log"
+    
+    log_filepath = os.path.join(log_dir, log_filename)
+    
+    # Create logger
+    logger = logging.getLogger(f"edd_logger_{timestamp}")
+    logger.setLevel(logging.DEBUG)
+    
+    # Clear any existing handlers
+    logger.handlers = []
+    
+    # Create file handler
+    file_handler = logging.FileHandler(log_filepath)
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Create console handler (optional - keeps console output)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Create formatter with IST timezone
+    class ISTFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):
+            dt = datetime.fromtimestamp(record.created, tz=timezone(timedelta(hours=5, minutes=30)))
+            return dt.strftime('%Y-%m-%d %H:%M:%S IST')
+    
+    formatter = ISTFormatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    logger.info(f"Logger initialized. Log file: {log_filepath}")
+    return logger
+
+def generate_edd(table_name: str, output_path: str = "/tmp/edd", 
                 filter_condition: Optional[str] = None, 
-                sample_threshold: int = 50_000_000) -> str:
+                sample_threshold: int = 50_000_000,
+                logger: logging.Logger = None) -> str:
     """
     Fast EDD generation using pure schema-based type detection
     """
     
-    print(f"Processing: {table_name}")
+    # Set up logger if not provided
+    if logger is None:
+        logger = setup_logger(output_path, table_name)
+    
+    logger.info(f"Processing: {table_name}")
     start_time = time.time()
     
     # Load and prepare data
     df = spark.table(table_name)
     if filter_condition:
         df = df.filter(filter_condition)
+        logger.info(f"Applied filter: {filter_condition}")
     
     # Get table size and determine strategy
     total_rows = df.count()
@@ -27,20 +83,20 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     
     if sample_rate < 1.0:
         df = df.sample(sample_rate, seed=42)
-        print(f"Sampling {sample_rate:.3f} of {total_rows:,} rows")
+        logger.info(f"Sampling {sample_rate:.3f} of {total_rows:,} rows")
         total_rows = df.count()
     
     df.cache()
     columns = df.columns
-    print(f"Analyzing {total_rows:,} rows, {len(columns)} columns")
+    logger.info(f"Analyzing {total_rows:,} rows, {len(columns)} columns")
     
     # Schema-based type detection (INSTANT)
-    print("Detecting column types from schema...")
-    numeric_columns, categorical_columns = _classify_columns_by_schema(df)
-    print(f"Numeric: {len(numeric_columns)}, Categorical: {len(categorical_columns)}")
+    logger.info("Detecting column types from schema...")
+    numeric_columns, categorical_columns = _classify_columns_by_schema(df, logger)
+    logger.info(f"Numeric: {len(numeric_columns)}, Categorical: {len(categorical_columns)}")
     
     # Batch operations for basic statistics
-    print("Computing basic statistics...")
+    logger.info("Computing basic statistics...")
     
     # Batch null counts for all columns
     null_exprs = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
@@ -53,29 +109,29 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     # Batch numeric statistics
     numeric_stats = {}
     if numeric_columns:
-        print(f"Computing numeric statistics for {len(numeric_columns)} columns...")
-        numeric_stats = _get_batch_numeric_stats(df, numeric_columns)
+        logger.info(f"Computing numeric statistics for {len(numeric_columns)} columns...")
+        numeric_stats = _get_batch_numeric_stats(df, numeric_columns, logger)
     
     # Process results
-    print("Building results...")
+    logger.info("Building results...")
     results = []
     
     for i, column_name in enumerate(columns, 1):
         try:
-            print(f"Processing column {i}/{len(columns)}: {column_name}")
+            logger.debug(f"Processing column {i}/{len(columns)}: {column_name}")
             
             # Check if keys exist in dictionaries
             null_key = f"null_{column_name}"
             unique_key = f"unique_{column_name}"
             
             if null_key not in null_counts:
-                print(f"WARNING: Missing null count for {column_name}")
+                logger.warning(f"Missing null count for {column_name}")
                 null_count = 0
             else:
                 null_count = null_counts[null_key]
                 
             if unique_key not in unique_counts:
-                print(f"WARNING: Missing unique count for {column_name}")
+                logger.warning(f"Missing unique count for {column_name}")
                 unique_count = 0
             else:
                 unique_count = unique_counts[unique_key]
@@ -83,21 +139,21 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
             non_null_count = total_rows - null_count
             
             if column_name in numeric_columns:
-                print(f"  -> Processing as NUMERIC")
+                logger.debug(f"  -> Processing as NUMERIC")
                 result = _build_numeric_result(i, column_name, null_count, non_null_count, 
-                                             unique_count, numeric_stats.get(column_name, {}))
+                                             unique_count, numeric_stats.get(column_name, {}), logger)
             else:
-                print(f"  -> Processing as CATEGORICAL")
+                logger.debug(f"  -> Processing as CATEGORICAL")
                 result = _build_categorical_result(df, i, column_name, null_count, 
-                                                 non_null_count, unique_count)
+                                                 non_null_count, unique_count, logger)
             
             results.append(result)
-            print(f"  -> SUCCESS")
+            logger.debug(f"  -> SUCCESS")
             
         except Exception as e:
-            print(f"ERROR processing column {column_name}: {type(e).__name__}: {str(e)}")
+            logger.error(f"ERROR processing column {column_name}: {type(e).__name__}: {str(e)}")
             import traceback
-            traceback.print_exc()
+            logger.error(traceback.format_exc())
             
             # Add a basic error result so processing continues
             error_result = {
@@ -132,11 +188,11 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     pd.DataFrame(results).to_csv(filepath, index=False)
     
     elapsed = (time.time() - start_time) / 60
-    print(f"EDD completed in {elapsed:.1f} minutes: {filepath}")
+    logger.info(f"EDD completed in {elapsed:.1f} minutes: {filepath}")
     
     return filepath
 
-def _classify_columns_by_schema(df) -> tuple[List[str], List[str]]:
+def _classify_columns_by_schema(df, logger: logging.Logger = None) -> tuple[List[str], List[str]]:
     """
     Classify columns as numeric or categorical based on Spark schema
     Fast schema-based approach - no data scanning required
@@ -156,13 +212,17 @@ def _classify_columns_by_schema(df) -> tuple[List[str], List[str]]:
         
         if column_type in numeric_types:
             numeric_columns.append(column_name)
+            if logger:
+                logger.debug(f"  {column_name}: {field.dataType} -> NUMERIC")
         else:
             # Everything else is categorical: String, Boolean, Date, Timestamp, Arrays, etc.
             categorical_columns.append(column_name)
+            if logger:
+                logger.debug(f"  {column_name}: {field.dataType} -> CATEGORICAL")
     
     return numeric_columns, categorical_columns
 
-def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
+def _get_batch_numeric_stats(df, numeric_columns: List[str], logger: logging.Logger = None) -> Dict:
     """Get numeric statistics for all numeric columns efficiently"""
     
     if not numeric_columns:
@@ -180,8 +240,12 @@ def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
         try:
             percentiles = df.select(column_name).na.drop().approxQuantile(column_name, percentile_values, 0.01)
             percentile_stats[column_name] = percentiles
-        except:
+            if logger:
+                logger.debug(f"  Percentiles for {column_name}: {len(percentiles)} values")
+        except Exception as e:
             percentile_stats[column_name] = [None] * 7
+            if logger:
+                logger.warning(f"  Failed to get percentiles for {column_name}: {e}")
     
     # Combine all statistics
     combined_stats = {}
@@ -196,6 +260,8 @@ def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
             }
         except Exception as e:
             combined_stats[column_name] = {'error': str(e)}
+            if logger:
+                logger.warning(f"  Failed to get stats for {column_name}: {e}")
     
     return combined_stats
 
@@ -380,22 +446,26 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
         'Max_or_Bot1': default_val
     }
 
-def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
+def batch_edd(table_list: List[str], output_path: str = "/tmp/edd", 
               sample_threshold: int = 50_000_000) -> Dict[str, str]:
     """Process multiple tables with performance tracking"""
     
-    print(f"Starting batch EDD for {len(table_list)} tables")
+    # Set up batch logger
+    batch_logger = setup_logger(output_path)
+    batch_logger.info(f"Starting batch EDD for {len(table_list)} tables")
     batch_start = time.time()
     
     results = {}
     summary_data = []
     
     for i, table_name in enumerate(table_list, 1):
-        print(f"\n[{i}/{len(table_list)}] {table_name}")
+        batch_logger.info(f"\n[{i}/{len(table_list)}] {table_name}")
         
         try:
             start_time = time.time()
-            filepath = generate_edd(table_name, output_path, sample_threshold=sample_threshold)
+            # Create individual logger for each table
+            table_logger = setup_logger(output_path, table_name)
+            filepath = generate_edd(table_name, output_path, sample_threshold=sample_threshold, logger=table_logger)
             elapsed = time.time() - start_time
             
             results[table_name] = filepath
@@ -406,10 +476,15 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
                 'Processing_Time_Minutes': round(elapsed / 60, 2)
             })
             
+            batch_logger.info(f"  -> SUCCESS: {filepath} ({elapsed/60:.1f} min)")
+            
         except Exception as e:
             error_msg = f"ERROR: {str(e)}"
             results[table_name] = error_msg
-            print(error_msg)
+            batch_logger.error(f"  -> FAILED: {error_msg}")
+            
+            import traceback
+            batch_logger.error(traceback.format_exc())
             
             summary_data.append({
                 'Table_Name': table_name,
@@ -426,17 +501,23 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
     successful = sum(1 for r in results.values() if r.endswith('.csv'))
     total_time = (time.time() - batch_start) / 60
     
-    print(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_time:.1f} minutes")
-    print(f"Summary saved: {summary_file}")
+    batch_logger.info(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_time:.1f} minutes")
+    batch_logger.info(f"Summary saved: {summary_file}")
+    batch_logger.info(f"Logs saved in: {output_path}/logs/")
     
     return results
 
 # Helper functions for file management
-def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
+def list_edd_files(output_path: str = "/tmp/edd") -> None:
     """List all EDD files in the output directory"""
     try:
         if os.path.exists(output_path):
             files = [f for f in os.listdir(output_path) if f.endswith('.csv')]
+            logs_dir = os.path.join(output_path, "logs")
+            log_files = []
+            if os.path.exists(logs_dir):
+                log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
+            
             if files:
                 print(f"EDD files in {output_path}:")
                 for i, filename in enumerate(files, 1):
@@ -446,6 +527,14 @@ def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
                 print(f"\nDownload via: Data → DBFS → tmp → edd")
             else:
                 print("No EDD files found")
+                
+            if log_files:
+                print(f"\nLog files in {logs_dir}:")
+                for i, filename in enumerate(log_files, 1):
+                    filepath = os.path.join(logs_dir, filename)
+                    size_kb = os.path.getsize(filepath) / 1024
+                    print(f"{i:2d}. {filename} ({size_kb:.1f} KB)")
+                print(f"Access logs via: Data → DBFS → tmp → edd → logs")
         else:
             print(f"Directory {output_path} does not exist")
     except Exception as e:
@@ -488,10 +577,49 @@ def show_schema_classification(table_name: str) -> None:
         col_type = dict(df.dtypes)[col_name]
         print(f"  {col_name} ({col_type})")
 
+def view_log_file(output_path: str = "/tmp/edd", log_filename: str = None) -> None:
+    """Display contents of a specific log file"""
+    
+    logs_dir = os.path.join(output_path, "logs")
+    
+    if not os.path.exists(logs_dir):
+        print(f"No logs directory found at {logs_dir}")
+        return
+    
+    log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
+    
+    if not log_files:
+        print("No log files found")
+        return
+    
+    if log_filename is None:
+        # Show most recent log file
+        log_files.sort(reverse=True)
+        log_filename = log_files[0]
+        print(f"Displaying most recent log: {log_filename}")
+    
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    if os.path.exists(log_filepath):
+        try:
+            with open(log_filepath, 'r') as f:
+                content = f.read()
+            print("-" * 80)
+            print(content)
+            print("-" * 80)
+        except Exception as e:
+            print(f"Error reading log file: {e}")
+    else:
+        print(f"Log file not found: {log_filename}")
+        print(f"Available log files: {log_files}")
+
 if __name__ == "__main__":
-    print("Fast Schema-based EDD system ready:")
+    print("Fast Schema-based EDD system with logging ready:")
     print("- generate_edd(table_name)")  
     print("- batch_edd(table_list)")
-    print("- list_edd_files()")
-    print("- display_edd_file(filepath)")
+    print("- list_edd_files() - see generated files and logs")
+    print("- display_edd_file(filepath) - view EDD in notebook")
     print("- show_schema_classification(table_name) - preview type detection")
+    print("- view_log_file() - view most recent log file")
+    print("- view_log_file(log_filename='specific_file.log') - view specific log")
+    print("\nAll processing details are saved to log files in /tmp/edd/logs/")
