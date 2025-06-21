@@ -8,8 +8,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-def _setup_logger(output_path = "/dbfs/tmp/edd"):
+def _setup_logger():
     """Setup clean file-only logger for audit trail"""
+    output_path = "/dbfs/tmp/edd"
     log_dir = os.path.join(output_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
@@ -33,39 +34,59 @@ logger = _setup_logger()
 
 def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                 filter_condition: Optional[str] = None, 
-                sample_threshold: int = 2_000_000) -> str:
-    """Generate EDD for single table with enhanced insights"""
+                target_sample_size: int = 2_000_000) -> str:
+    """Generate EDD for single table with three-tier sampling strategy"""
     
     start_time = time.time()
     
-    # Load data
+    # Load data and get total row count
     df = spark.table(table_name)
     if filter_condition:
         df = df.filter(filter_condition)
     
     total_rows = df.count()
-    sample_rate = min(1.0, sample_threshold / max(total_rows, 1))
     
-    if sample_rate < 1.0:
-        df = df.sample(sample_rate, seed=42)
-        actual_sample_size = df.count()
-    else:
+    # Three-tier sampling strategy
+    if total_rows <= 2_000_000:
+        # Tier 1: Use full dataset (≤2M rows)
+        df_to_analyze = df
         actual_sample_size = total_rows
+        sampling_method = "Full Dataset"
+        
+    elif total_rows <= 20_000_000:
+        # Tier 2: Standard random sampling (2M-20M rows)
+        sample_rate = target_sample_size / total_rows
+        df_to_analyze = df.sample(sample_rate, seed=42)
+        actual_sample_size = df_to_analyze.count()
+        sampling_method = f"Random Sample ({sample_rate:.4f})"
+        
+    else:
+        # Tier 3: TABLESAMPLE for large tables (20M+ rows)
+        table_sql = f"SELECT * FROM {table_name}"
+        if filter_condition:
+            table_sql += f" WHERE {filter_condition}"
+        table_sql += f" TABLESAMPLE({target_sample_size} ROWS)"
+        
+        df_to_analyze = spark.sql(table_sql)
+        actual_sample_size = target_sample_size  # TABLESAMPLE gives exact count
+        sampling_method = f"TABLESAMPLE ({target_sample_size:,} rows)"
     
-    df.cache()
-    columns = df.columns
+    print(f"  → Sampling: {sampling_method}")
+    
+    df_to_analyze.cache()
+    columns = df_to_analyze.columns
     
     # Schema classification
-    numeric_columns, categorical_columns = _classify_columns_by_schema(df)
+    numeric_columns, categorical_columns = _classify_columns_by_schema(df_to_analyze)
     
     # Batch statistics
     null_exprs = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
-    null_counts = df.select(null_exprs).collect()[0].asDict()
+    null_counts = df_to_analyze.select(null_exprs).collect()[0].asDict()
     
     unique_exprs = [approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns]
-    unique_counts = df.select(unique_exprs).collect()[0].asDict()
+    unique_counts = df_to_analyze.select(unique_exprs).collect()[0].asDict()
     
-    numeric_stats = _get_batch_numeric_stats(df, numeric_columns) if numeric_columns else {}
+    numeric_stats = _get_batch_numeric_stats(df_to_analyze, numeric_columns) if numeric_columns else {}
     
     # Build results
     results = []
@@ -80,7 +101,7 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
                                              null_count, non_null_count, unique_count, 
                                              numeric_stats.get(col_name, {}))
             else:
-                result = _build_categorical_result(df, i, col_name, total_rows, actual_sample_size,
+                result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, actual_sample_size,
                                                  null_count, non_null_count, unique_count)
             results.append(result)
             
@@ -88,7 +109,7 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
             logger.error(f"{table_name}.{col_name} failed: {e}")
             results.append(_build_error_result(i, col_name, total_rows, actual_sample_size, str(e)))
     
-    df.unpersist()
+    df_to_analyze.unpersist()
     
     # Save results
     os.makedirs(output_path, exist_ok=True)
@@ -361,10 +382,11 @@ def _build_error_result(field_num: int, column_name: str, total_rows: int, sampl
     }
 
 def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
-              sample_threshold: int = 2_000_000) -> Dict[str, str]:
-    """Process multiple tables"""
+              target_sample_size: int = 2_000_000) -> Dict[str, str]:
+    """Process multiple tables with three-tier sampling strategy"""
     
     print(f"Starting batch EDD: {len(table_list)} tables")
+    print(f"Sampling strategy: ≤2M=Full, 2M-20M=Random, 20M+=TABLESAMPLE({target_sample_size:,})")
     logger.info(f"BATCH START | {len(table_list)} tables")
     
     batch_start = time.time()
@@ -384,7 +406,7 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
             print(f"  → {total_rows:,} rows, {num_cols} columns")
             
             # Generate EDD
-            filepath = generate_edd(table_name, output_path, sample_threshold=sample_threshold)
+            filepath = generate_edd(table_name, output_path, target_sample_size=target_sample_size)
             elapsed = time.time() - table_start
             
             results[table_name] = filepath
@@ -494,7 +516,8 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("Enhanced EDD System Ready")
+    print("Enhanced EDD System Ready - Three-Tier Sampling Strategy")
+    print("Sampling: ≤2M=Full Data | 2M-20M=Random Sample | 20M+=TABLESAMPLE")
     print("Main: generate_edd(table) | batch_edd([tables])")  
     print("Utils: list_edd_files() | show_schema_classification(table) | view_log_file()")
-    print("Default sample: 2M rows | Enhanced with: Total_Rows, Sample_Size, Outlier_Count, Distribution_Shape")
+    print("Enhanced fields: Total_Rows, Sample_Size, Outlier_Count, Distribution_Shape")
