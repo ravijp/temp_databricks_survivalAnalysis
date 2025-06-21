@@ -15,48 +15,48 @@ def setup_logger(output_path: str, table_name: str = None) -> logging.Logger:
     log_dir = os.path.join(output_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
-    # Create log filename
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # Create unique log filename with microseconds for uniqueness
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    timestamp = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
+    
     if table_name:
         log_filename = f"edd_{table_name.replace('.', '_')}_{timestamp}.log"
+        logger_name = f"edd_table_{timestamp}"
     else:
         log_filename = f"edd_batch_{timestamp}.log"
+        logger_name = f"edd_batch_{timestamp}"
     
     log_filepath = os.path.join(log_dir, log_filename)
     
-    # Create logger
-    logger = logging.getLogger(f"edd_logger_{timestamp}")
+    # Create unique logger
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()  # Clean existing handlers
     
-    # Clear any existing handlers
-    logger.handlers = []
-    
-    # Create file handler
-    file_handler = logging.FileHandler(log_filepath)
-    file_handler.setLevel(logging.DEBUG)
-    
-    # Create console handler (optional - keeps console output)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    
-    # Create formatter with IST timezone
+    # IST formatter
     class ISTFormatter(logging.Formatter):
         def formatTime(self, record, datefmt=None):
             dt = datetime.fromtimestamp(record.created, tz=timezone(timedelta(hours=5, minutes=30)))
             return dt.strftime('%Y-%m-%d %H:%M:%S IST')
     
     formatter = ISTFormatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # File and console handlers
+    file_handler = logging.FileHandler(log_filepath)
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter('%(message)s'))
     
-    # Add handlers to logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
     logger.info(f"Logger initialized. Log file: {log_filepath}")
     return logger
 
-def generate_edd(table_name: str, output_path: str = "/tmp/edd", 
+def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                 filter_condition: Optional[str] = None, 
                 sample_threshold: int = 50_000_000,
                 logger: logging.Logger = None) -> str:
@@ -179,13 +179,19 @@ def generate_edd(table_name: str, output_path: str = "/tmp/edd",
     
     df.unpersist()
     
-    # Save results
+    # Save results with error handling
     os.makedirs(output_path, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
     filepath = os.path.join(output_path, filename)
     
-    pd.DataFrame(results).to_csv(filepath, index=False)
+    try:
+        pd.DataFrame(results).to_csv(filepath, index=False)
+        logger.info(f"EDD saved successfully: {filepath}")
+    except Exception as e:
+        logger.error(f"Failed to save EDD file: {e}")
+        raise
     
     elapsed = (time.time() - start_time) / 60
     logger.info(f"EDD completed in {elapsed:.1f} minutes: {filepath}")
@@ -446,7 +452,7 @@ def _build_categorical_result(df, field_num: int, column_name: str, null_count: 
         'Max_or_Bot1': default_val
     }
 
-def batch_edd(table_list: List[str], output_path: str = "/tmp/edd", 
+def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
               sample_threshold: int = 50_000_000) -> Dict[str, str]:
     """Process multiple tables with performance tracking"""
     
@@ -463,8 +469,13 @@ def batch_edd(table_list: List[str], output_path: str = "/tmp/edd",
         
         try:
             start_time = time.time()
-            # Create individual logger for each table
-            table_logger = setup_logger(output_path, table_name)
+            # Create individual logger for each table (optional)
+            try:
+                table_logger = setup_logger(output_path, table_name)
+            except Exception as log_error:
+                batch_logger.warning(f"Could not create table logger: {log_error}, using batch logger")
+                table_logger = batch_logger
+                
             filepath = generate_edd(table_name, output_path, sample_threshold=sample_threshold, logger=table_logger)
             elapsed = time.time() - start_time
             
@@ -494,49 +505,52 @@ def batch_edd(table_list: List[str], output_path: str = "/tmp/edd",
                 'Error': str(e)
             })
     
-    # Generate batch summary
-    summary_file = os.path.join(output_path, f"batch_summary_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    pd.DataFrame(summary_data).to_csv(summary_file, index=False)
+    # Generate batch summary with error handling
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    summary_file = os.path.join(output_path, f"batch_summary_{timestamp}.csv")
+    
+    try:
+        pd.DataFrame(summary_data).to_csv(summary_file, index=False)
+        batch_logger.info(f"Summary saved: {summary_file}")
+    except Exception as e:
+        batch_logger.error(f"Failed to save summary file: {e}")
     
     successful = sum(1 for r in results.values() if r.endswith('.csv'))
     total_time = (time.time() - batch_start) / 60
     
     batch_logger.info(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_time:.1f} minutes")
-    batch_logger.info(f"Summary saved: {summary_file}")
     batch_logger.info(f"Logs saved in: {output_path}/logs/")
     
     return results
 
 # Helper functions for file management
-def list_edd_files(output_path: str = "/tmp/edd") -> None:
-    """List all EDD files in the output directory"""
+def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
+    """List all EDD files and logs"""
     try:
-        if os.path.exists(output_path):
-            files = [f for f in os.listdir(output_path) if f.endswith('.csv')]
-            logs_dir = os.path.join(output_path, "logs")
-            log_files = []
-            if os.path.exists(logs_dir):
-                log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
-            
-            if files:
-                print(f"EDD files in {output_path}:")
-                for i, filename in enumerate(files, 1):
-                    filepath = os.path.join(output_path, filename)
-                    size_mb = os.path.getsize(filepath) / (1024*1024)
-                    print(f"{i:2d}. {filename} ({size_mb:.2f} MB)")
-                print(f"\nDownload via: Data → DBFS → tmp → edd")
-            else:
-                print("No EDD files found")
-                
-            if log_files:
-                print(f"\nLog files in {logs_dir}:")
-                for i, filename in enumerate(log_files, 1):
-                    filepath = os.path.join(logs_dir, filename)
-                    size_kb = os.path.getsize(filepath) / 1024
-                    print(f"{i:2d}. {filename} ({size_kb:.1f} KB)")
-                print(f"Access logs via: Data → DBFS → tmp → edd → logs")
-        else:
+        if not os.path.exists(output_path):
             print(f"Directory {output_path} does not exist")
+            return
+            
+        # EDD files
+        files = [f for f in os.listdir(output_path) if f.endswith('.csv')]
+        if files:
+            print(f"EDD files ({len(files)}):")
+            for i, filename in enumerate(files, 1):
+                size_mb = os.path.getsize(os.path.join(output_path, filename)) / (1024*1024)
+                print(f"{i:2d}. {filename} ({size_mb:.2f} MB)")
+        else:
+            print("No EDD files found")
+            
+        # Log files
+        logs_dir = os.path.join(output_path, "logs")
+        if os.path.exists(logs_dir):
+            log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
+            if log_files:
+                print(f"\nLog files ({len(log_files)}): Data → DBFS → tmp → edd → logs")
+        
+        print(f"\nDownload: Data → DBFS → tmp → edd")
+        
     except Exception as e:
         print(f"Error: {e}")
 
@@ -562,7 +576,7 @@ def display_edd_file(filepath: str, num_rows: int = 20) -> None:
 def show_schema_classification(table_name: str) -> None:
     """Helper function to preview schema-based classification"""
     df = spark.table(table_name)
-    numeric_cols, categorical_cols = _classify_columns_by_schema(df)
+    numeric_cols, categorical_cols = _classify_columns_by_schema(df, None)  # Fixed: pass None for logger
     
     print(f"Schema classification for: {table_name}")
     print(f"Total columns: {len(df.columns)}")
@@ -577,7 +591,7 @@ def show_schema_classification(table_name: str) -> None:
         col_type = dict(df.dtypes)[col_name]
         print(f"  {col_name} ({col_type})")
 
-def view_log_file(output_path: str = "/tmp/edd", log_filename: str = None) -> None:
+def view_log_file(output_path: str = "/dbfs/tmp/edd", log_filename: str = None) -> None:
     """Display contents of a specific log file"""
     
     logs_dir = os.path.join(output_path, "logs")
@@ -587,39 +601,29 @@ def view_log_file(output_path: str = "/tmp/edd", log_filename: str = None) -> No
         return
     
     log_files = [f for f in os.listdir(logs_dir) if f.endswith('.log')]
-    
     if not log_files:
         print("No log files found")
         return
     
     if log_filename is None:
-        # Show most recent log file
         log_files.sort(reverse=True)
         log_filename = log_files[0]
         print(f"Displaying most recent log: {log_filename}")
     
     log_filepath = os.path.join(logs_dir, log_filename)
     
-    if os.path.exists(log_filepath):
-        try:
-            with open(log_filepath, 'r') as f:
-                content = f.read()
+    try:
+        with open(log_filepath, 'r') as f:
             print("-" * 80)
-            print(content)
+            print(f.read())
             print("-" * 80)
-        except Exception as e:
-            print(f"Error reading log file: {e}")
-    else:
-        print(f"Log file not found: {log_filename}")
-        print(f"Available log files: {log_files}")
+    except Exception as e:
+        print(f"Error reading log: {e}")
+        print(f"Available: {log_files}")
 
 if __name__ == "__main__":
-    print("Fast Schema-based EDD system with logging ready:")
-    print("- generate_edd(table_name)")  
-    print("- batch_edd(table_list)")
-    print("- list_edd_files() - see generated files and logs")
-    print("- display_edd_file(filepath) - view EDD in notebook")
-    print("- show_schema_classification(table_name) - preview type detection")
-    print("- view_log_file() - view most recent log file")
-    print("- view_log_file(log_filename='specific_file.log') - view specific log")
-    print("\nAll processing details are saved to log files in /tmp/edd/logs/")
+    print("Fast Schema-based EDD system with IST logging ready:")
+    print("- generate_edd(table_name)  |  batch_edd(table_list)")  
+    print("- list_edd_files()  |  display_edd_file(filepath)")
+    print("- show_schema_classification(table_name)  |  view_log_file()")
+    print("All logs saved to /dbfs/tmp/edd/logs/ with IST timestamps")
