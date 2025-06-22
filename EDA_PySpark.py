@@ -303,7 +303,7 @@ def _classify_numeric_distribution(mean: Optional[float], median: Optional[float
 
 def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
                           null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
-    """Build temporal column result with simple date insights"""
+    """Build temporal column result with simplified percentile analysis"""
     
     # Check if we should fallback to categorical processing
     if stats.get('fallback_to_categorical'):
@@ -312,7 +312,10 @@ def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sa
     min_date = stats.get('min_date', '')
     max_date = stats.get('max_date', '')
     date_range_days = stats.get('date_range_days', 0)
-    frequency_pattern = stats.get('frequency_pattern', 'Temporal')
+    q1_date = stats.get('q1_date', '')
+    median_date = stats.get('median_date', '')
+    q3_date = stats.get('q3_date', '')
+    pattern = stats.get('pattern', 'Temporal')
     
     return {
         'Field_Num': field_num,
@@ -324,18 +327,18 @@ def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sa
         'Num_Entries': non_null_count,
         'Num_Unique': unique_count,
         'Outlier_Count': 0,
-        'Distribution_Shape': frequency_pattern,
+        'Distribution_Shape': pattern,
         'Stddev': date_range_days,
-        'Mean_or_Top1': frequency_pattern,
-        'Min_or_Top2': min_date,
-        'P1_or_Top3': '',
-        'P5_or_Top4': '',
-        'P25_or_Top5': '',
-        'Median_or_Bot5': '',
-        'P75_or_Bot4': '',
-        'P95_or_Bot3': '',
-        'P99_or_Bot2': '',
-        'Max_or_Bot1': max_date
+        'Mean_or_Top1': median_date,      # Median date
+        'Min_or_Top2': min_date,          # Earliest date
+        'P1_or_Top3': '',                 # Not calculated (simplified)
+        'P5_or_Top4': '',                 # Not calculated (simplified)
+        'P25_or_Top5': q1_date,           # Q1 date (25th percentile)
+        'Median_or_Bot5': median_date,    # Median date (duplicate for consistency)
+        'P75_or_Bot4': q3_date,           # Q3 date (75th percentile)
+        'P95_or_Bot3': '',                # Not calculated (simplified)
+        'P99_or_Bot2': '',                # Not calculated (simplified)
+        'Max_or_Bot1': max_date           # Latest date
     }
 
 def _build_boolean_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
@@ -405,7 +408,7 @@ def _build_complex_result(field_num: int, column_name: str, total_rows: int, sam
     }
 
 def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
-    """Get temporal statistics with simple fallback to categorical processing"""
+    """Get simplified temporal statistics (Q1, Median, Q3 only)"""
     if not temporal_columns:
         return {}
     
@@ -413,14 +416,13 @@ def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
     
     for col_name in temporal_columns:
         try:
-            # Simple approach - get min/max dates only
             temp_df = df.select(col_name).filter(col(col_name).isNotNull())
             
             if temp_df.count() == 0:
                 temporal_stats[col_name] = {'fallback_to_categorical': True}
                 continue
             
-            # Try basic min/max - if this fails, fallback to categorical
+            # Get min/max dates
             min_max = temp_df.agg(
                 F.min(col_name).alias('min_date'),
                 F.max(col_name).alias('max_date')
@@ -429,25 +431,48 @@ def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
             min_date = str(min_max['min_date']) if min_max['min_date'] else ''
             max_date = str(min_max['max_date']) if min_max['max_date'] else ''
             
-            # Calculate simple date range
+            # Calculate date range in days
             try:
-                if min_max['min_date'] and min_max['max_date']:
-                    date_range_days = (min_max['max_date'] - min_max['min_date']).days
-                else:
-                    date_range_days = 0
+                date_range_days = (min_max['max_date'] - min_max['min_date']).days
             except:
                 date_range_days = 0
+            
+            # Calculate 3 percentiles using days since epoch
+            q1_date = median_date = q3_date = ''
+            try:
+                epoch_df = temp_df.select(F.datediff(col_name, F.lit('1970-01-01')).alias('days'))
+                percentile_days = epoch_df.approxQuantile('days', [0.25, 0.5, 0.75], 0.05)
+                
+                # Convert back to dates
+                base_date = datetime(1970, 1, 1).date()
+                if len(percentile_days) >= 3 and all(p is not None for p in percentile_days):
+                    q1_date = str(base_date + timedelta(days=int(percentile_days[0])))
+                    median_date = str(base_date + timedelta(days=int(percentile_days[1])))
+                    q3_date = str(base_date + timedelta(days=int(percentile_days[2])))
+            except:
+                q1_date = median_date = q3_date = ''
+            
+            # Simple pattern detection
+            if date_range_days < 90:
+                pattern = "Clustered"
+            elif '2024' in median_date or '2025' in median_date:
+                pattern = "Recent_Heavy"
+            elif '2020' in median_date or '2021' in median_date:
+                pattern = "Historical_Heavy"
+            else:
+                pattern = "Uniform"
             
             temporal_stats[col_name] = {
                 'min_date': min_date,
                 'max_date': max_date,
                 'date_range_days': date_range_days,
-                'frequency_pattern': 'Temporal',
-                'outlier_count': 0
+                'q1_date': q1_date,
+                'median_date': median_date, 
+                'q3_date': q3_date,
+                'pattern': pattern
             }
             
         except Exception:
-            # Fallback to categorical processing
             temporal_stats[col_name] = {'fallback_to_categorical': True}
     
     return temporal_stats
