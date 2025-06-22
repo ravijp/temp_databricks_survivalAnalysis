@@ -8,6 +8,92 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
+import pandas as pd
+import os
+import glob
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def analyze_edd_errors(directory: str = '/mnt/edd/') -> pd.DataFrame:
+    """Find EDD files with errors, sorted by record count."""
+    
+    files = [f for f in glob.glob(os.path.join(directory, "*.csv")) 
+             if 'edd' in os.path.basename(f) and 'summary' not in os.path.basename(f)]
+    
+    logger.info(f"Found {len(files)} EDD files")
+    
+    results = []
+    for file_path in files:
+        try:
+            table_name = os.path.basename(file_path).split('_edd_')[0]
+            df = pd.read_csv(file_path)
+            
+            if df.empty:
+                continue
+            
+            # Count errors
+            error_count = len(df[df['Type'] == 'Error'])
+            failed_stats = len(df[df['Mean_or_Top1'].astype(str).str.contains('Error:', na=False)])
+            date_misclass = len(df[(df['Type'] == 'Categorical') & 
+                                 (df['Field_Name'].str.contains('_dt|_date|date_|time', case=False, na=False))])
+            
+            total_issues = error_count + failed_stats + date_misclass
+            
+            if total_issues > 0:
+                results.append({
+                    'table_name': table_name,
+                    'file_path': file_path,
+                    'total_rows': df['Total_Rows'].iloc[0],
+                    'total_columns': len(df),
+                    'error_columns': error_count,
+                    'failed_stats': failed_stats,
+                    'misclassified_dates': date_misclass,
+                    'total_issues': total_issues
+                })
+                
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}")
+    
+    if results:
+        return pd.DataFrame(results).sort_values('total_rows', ascending=False)
+    return pd.DataFrame()
+
+def run_edd_error_analysis():
+    """Execute EDD error analysis and generate report."""
+    results = analyze_edd_errors('/mnt/edd/')
+    
+    if results.empty:
+        print("No EDD files with errors found")
+        return
+    
+    # Save results
+    output_path = '/mnt/edd/error_analysis.csv'
+    results.to_csv(output_path, index=False)
+    
+    # Print report
+    print(f"\nTables with EDD errors (sorted by record count):")
+    print(f"{'Table':<40} {'Records':<12} {'Columns':<8} {'Errors':<8} {'Failed Stats':<12} {'Date Issues':<12}")
+    print("-" * 100)
+    
+    for _, row in results.iterrows():
+        candidate = "← CANDIDATE" if row['total_rows'] < 1_000_000 and row['total_issues'] >= 2 else ""
+        print(f"{row['table_name']:<40} {row['total_rows']:<12,} {row['total_columns']:<8} "
+              f"{row['error_columns']:<8} {row['failed_stats']:<12} {row['misclassified_dates']:<12} {candidate}")
+    
+    # Show candidates for deep analysis
+    candidates = results[(results['total_rows'] < 1_000_000) & (results['total_issues'] >= 2)]
+    if not candidates.empty:
+        print(f"\nRecommended for deep analysis (<1M records, 2+ issues):")
+        for _, row in candidates.iterrows():
+            print(f"- {row['table_name']}")
+    
+    logger.info(f"Analysis complete. Results saved to {output_path}")
+
+# Call this function to run the analysis
+# run_edd_error_analysis()
+
 def _setup_logger(output_path = "/dbfs/tmp/edd"):
     """Setup file-only logger for audit trail"""
     try:
