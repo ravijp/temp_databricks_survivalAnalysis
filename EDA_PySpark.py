@@ -8,10 +8,10 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-def _setup_logger():
+def _setup_logger(output_path = "/dbfs/tmp/edd"):
     """Setup file-only logger for audit trail"""
     try:
-        output_path = "/dbfs/tmp/edd"
+        
         log_dir = os.path.join(output_path, "logs")
         os.makedirs(log_dir, exist_ok=True)
         
@@ -47,18 +47,29 @@ logger = _setup_logger()
 def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                 filter_condition: Optional[str] = None, 
                 target_sample_size: int = 2_000_000) -> str:
-    """Generate EDD for single table with three-tier sampling strategy"""
+    """Generate EDD for single table with enhanced robustness"""
     
     start_time = time.time()
     
-    # Load data and get total row count
-    df = spark.table(table_name)
+    # Table access protection
+    try:
+        df = spark.table(table_name)
+    except Exception as e:
+        return _build_table_error_result(table_name, str(e))
+    
+    # Apply filter if provided
     if filter_condition:
-        df = df.filter(filter_condition)
+        try:
+            df = df.filter(filter_condition)
+        except Exception as e:
+            return _build_table_error_result(table_name, f"Filter error: {str(e)}")
     
+    # Zero records protection
     total_rows = df.count()
+    if total_rows == 0:
+        return _build_empty_table_result(table_name)
     
-    # Three-tier sampling strategy
+    # Three-tier sampling strategy with TABLESAMPLE fallback
     if total_rows <= 2_000_000:
         # Tier 1: Use full dataset (≤2M rows)
         df_to_analyze = df
@@ -73,15 +84,23 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         sampling_method = f"Random Sample ({sample_rate:.4f})"
         
     else:
-        # Tier 3: TABLESAMPLE for large tables (20M+ rows)
-        table_sql = f"SELECT * FROM {table_name}"
-        if filter_condition:
-            table_sql += f" WHERE {filter_condition}"
-        table_sql += f" TABLESAMPLE({target_sample_size} ROWS)"
-        
-        df_to_analyze = spark.sql(table_sql)
-        actual_sample_size = target_sample_size  # TABLESAMPLE gives exact count
-        sampling_method = f"TABLESAMPLE ({target_sample_size:,} rows)"
+        # Tier 3: TABLESAMPLE for large tables (20M+ rows) with fallback
+        try:
+            table_sql = f"SELECT * FROM {table_name}"
+            if filter_condition:
+                table_sql += f" WHERE {filter_condition}"
+            table_sql += f" TABLESAMPLE({target_sample_size} ROWS)"
+            
+            df_to_analyze = spark.sql(table_sql)
+            actual_sample_size = target_sample_size  # TABLESAMPLE gives exact count
+            sampling_method = f"TABLESAMPLE ({target_sample_size:,} rows)"
+        except Exception as e:
+            # TABLESAMPLE fallback to regular sampling
+            sample_rate = target_sample_size / total_rows
+            df_to_analyze = df.sample(sample_rate, seed=42)
+            actual_sample_size = df_to_analyze.count()
+            sampling_method = f"Sample Fallback ({sample_rate:.4f})"
+            logger.warning(f"TABLESAMPLE failed for {table_name}, using regular sampling: {e}")
     
     print(f"  → Sampling: {sampling_method}")
     
@@ -408,7 +427,7 @@ def _build_complex_result(field_num: int, column_name: str, total_rows: int, sam
     }
 
 def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
-    """Get simplified temporal statistics (Q1, Median, Q3 only)"""
+    """Get simplified temporal statistics with enhanced safety"""
     if not temporal_columns:
         return {}
     
@@ -418,7 +437,9 @@ def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
         try:
             temp_df = df.select(col_name).filter(col(col_name).isNotNull())
             
-            if temp_df.count() == 0:
+            # Enhanced temporal processing protection
+            record_count = temp_df.count()
+            if record_count == 0:
                 temporal_stats[col_name] = {'fallback_to_categorical': True}
                 continue
             
@@ -437,18 +458,19 @@ def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
             except:
                 date_range_days = 0
             
-            # Calculate 3 percentiles using days since epoch
+            # Calculate 3 percentiles using days since epoch with protection
             q1_date = median_date = q3_date = ''
             try:
                 epoch_df = temp_df.select(F.datediff(col_name, F.lit('1970-01-01')).alias('days'))
-                percentile_days = epoch_df.approxQuantile('days', [0.25, 0.5, 0.75], 0.05)
-                
-                # Convert back to dates
-                base_date = datetime(1970, 1, 1).date()
-                if len(percentile_days) >= 3 and all(p is not None for p in percentile_days):
-                    q1_date = str(base_date + timedelta(days=int(percentile_days[0])))
-                    median_date = str(base_date + timedelta(days=int(percentile_days[1])))
-                    q3_date = str(base_date + timedelta(days=int(percentile_days[2])))
+                if epoch_df.count() > 0:  # Additional safety check
+                    percentile_days = epoch_df.approxQuantile('days', [0.25, 0.5, 0.75], 0.05)
+                    
+                    # Convert back to dates
+                    base_date = datetime(1970, 1, 1).date()
+                    if len(percentile_days) >= 3 and all(p is not None for p in percentile_days):
+                        q1_date = str(base_date + timedelta(days=int(percentile_days[0])))
+                        median_date = str(base_date + timedelta(days=int(percentile_days[1])))
+                        q3_date = str(base_date + timedelta(days=int(percentile_days[2])))
             except:
                 q1_date = median_date = q3_date = ''
             
@@ -478,7 +500,7 @@ def _get_temporal_stats(df, temporal_columns: List[str]) -> Dict:
     return temporal_stats
 
 def _get_boolean_stats(df, boolean_columns: List[str]) -> Dict:
-    """Get boolean statistics treating as 0/1 numeric"""
+    """Get boolean statistics with empty result set protection"""
     if not boolean_columns:
         return {}
     
@@ -486,8 +508,16 @@ def _get_boolean_stats(df, boolean_columns: List[str]) -> Dict:
     
     for col_name in boolean_columns:
         try:
-            # Convert boolean to 0/1 and get statistics
             bool_df = df.select(col_name).filter(col(col_name).isNotNull())
+            
+            # Empty result set protection
+            if bool_df.count() == 0:
+                boolean_stats[col_name] = {
+                    'mean': 0.0, 'stddev': 0.0, 'min': 0, 'max': 1,
+                    'true_percentage': 0.0, 'percentiles': [0, 0, 0, 0, 1, 1, 1],
+                    'distribution_shape': 'No_Data', 'outlier_count': 0
+                }
+                continue
             
             # Get basic stats
             stats = bool_df.select(
@@ -519,7 +549,7 @@ def _get_boolean_stats(df, boolean_columns: List[str]) -> Dict:
                 'true_percentage': true_percentage,
                 'percentiles': percentiles,
                 'distribution_shape': distribution_shape,
-                'outlier_count': 0  # Not applicable for boolean
+                'outlier_count': 0
             }
             
         except Exception as e:
@@ -528,7 +558,7 @@ def _get_boolean_stats(df, boolean_columns: List[str]) -> Dict:
     return boolean_stats
 
 def _get_complex_stats(df, complex_columns: List[str]) -> Dict:
-    """Get minimal statistics for complex columns (arrays, maps, structs)"""
+    """Get minimal statistics for complex columns with empty result set protection"""
     if not complex_columns:
         return {}
     
@@ -536,28 +566,31 @@ def _get_complex_stats(df, complex_columns: List[str]) -> Dict:
     
     for col_name in complex_columns:
         try:
-            # Basic analysis for complex types
             non_null_df = df.select(col_name).filter(col(col_name).isNotNull())
+            
+            # Empty result set protection
+            if non_null_df.count() == 0:
+                complex_stats[col_name] = {
+                    'avg_structure_size': 0.0, 'max_structure_size': 0.0,
+                    'analysis_type': 'Complex', 'outlier_count': 0, 'distribution_shape': 'No_Data'
+                }
+                continue
             
             # Try to get size information for arrays/maps
             try:
-                if 'array' in str(df.select(col_name).dtypes[0][1]).lower():
-                    # Array type - get size distribution
+                col_type_str = str(df.select(col_name).dtypes[0][1]).lower()
+                if 'array' in col_type_str:
                     size_stats = non_null_df.select(F.size(col_name).alias('array_size')).describe().collect()
                     avg_size = float([row['array_size'] for row in size_stats if row['summary'] == 'mean'][0])
                     max_size = float([row['array_size'] for row in size_stats if row['summary'] == 'max'][0])
-                elif 'map' in str(df.select(col_name).dtypes[0][1]).lower():
-                    # Map type - get size distribution
+                elif 'map' in col_type_str:
                     size_stats = non_null_df.select(F.size(col_name).alias('map_size')).describe().collect()
                     avg_size = float([row['map_size'] for row in size_stats if row['summary'] == 'mean'][0])
                     max_size = float([row['map_size'] for row in size_stats if row['summary'] == 'max'][0])
                 else:
-                    # Struct or other complex type
-                    avg_size = 1.0
-                    max_size = 1.0
+                    avg_size = max_size = 1.0
             except:
-                avg_size = 0.0
-                max_size = 0.0
+                avg_size = max_size = 0.0
             
             complex_stats[col_name] = {
                 'avg_structure_size': avg_size,
@@ -630,7 +663,7 @@ def _build_numeric_result(field_num: int, column_name: str, total_rows: int, sam
 
 def _build_categorical_result(df, field_num: int, column_name: str, total_rows: int, sample_size: int,
                             null_count: int, non_null_count: int, unique_count: int) -> Dict:
-    """Build categorical column result with full original values"""
+    """Build categorical column result with empty result set protection"""
     
     base_result = {
         'Field_Num': field_num,
@@ -646,8 +679,8 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
         'Stddev': None
     }
     
-    # Handle edge cases
-    if unique_count == 0:
+    # Enhanced empty result set protection
+    if unique_count == 0 or non_null_count == 0:
         values = ['No_Data'] * 10
     elif unique_count == 1:
         try:
@@ -672,6 +705,7 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
                           .limit(limit_size)
                           .collect())
             
+            # Empty result set protection
             if not value_counts:
                 values = ['No_Data'] * 10
             else:
@@ -694,7 +728,7 @@ def _build_categorical_result(df, field_num: int, column_name: str, total_rows: 
                 else:
                     values = (formatted + [''] * 10)[:10]
                     
-        except Exception as e:
+        except Exception:
             values = ['High_Cardinality'] * 10
     
     # Map to result fields
@@ -731,6 +765,55 @@ def _build_error_result(field_num: int, column_name: str, total_rows: int, sampl
         'P99_or_Bot2': None,
         'Max_or_Bot1': None
     }
+
+def _build_empty_table_result(table_name: str, output_path = "/dbfs/tmp/edd") -> str:
+    """Build result file for empty tables"""
+    try:
+        
+        os.makedirs(output_path, exist_ok=True)
+        timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
+        filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
+        filepath = os.path.join(output_path, filename)
+        
+        empty_result = [{
+            'Field_Num': 1, 'Field_Name': 'EMPTY_TABLE', 'Type': 'Empty',
+            'Total_Rows': 0, 'Sample_Size': 0, 'Num_Blanks': 0, 'Num_Entries': 0, 'Num_Unique': 0,
+            'Outlier_Count': 0, 'Distribution_Shape': 'Empty', 'Stddev': None,
+            'Mean_or_Top1': 'No_Data', 'Min_or_Top2': None, 'P1_or_Top3': None, 'P5_or_Top4': None,
+            'P25_or_Top5': None, 'Median_or_Bot5': None, 'P75_or_Bot4': None, 'P95_or_Bot3': None,
+            'P99_or_Bot2': None, 'Max_or_Bot1': None
+        }]
+        
+        pd.DataFrame(empty_result).to_csv(filepath, index=False)
+        logger.info(f"{table_name} | 0 rows | 0 cols | 0.0m | {os.path.basename(filepath)} | EMPTY")
+        return filepath
+    except Exception as e:
+        logger.error(f"{table_name} empty table result failed: {e}")
+        raise
+
+def _build_table_error_result(table_name: str, error_msg: str, output_path = "/dbfs/tmp/edd") -> str:
+    """Build result file for table access errors"""
+    try:
+        os.makedirs(output_path, exist_ok=True)
+        timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
+        filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
+        filepath = os.path.join(output_path, filename)
+        
+        error_result = [{
+            'Field_Num': 1, 'Field_Name': 'TABLE_ACCESS_ERROR', 'Type': 'Error',
+            'Total_Rows': 0, 'Sample_Size': 0, 'Num_Blanks': 0, 'Num_Entries': 0, 'Num_Unique': 0,
+            'Outlier_Count': 0, 'Distribution_Shape': 'Error', 'Stddev': None,
+            'Mean_or_Top1': f'Table Error: {error_msg}', 'Min_or_Top2': None, 'P1_or_Top3': None,
+            'P5_or_Top4': None, 'P25_or_Top5': None, 'Median_or_Bot5': None, 'P75_or_Bot4': None,
+            'P95_or_Bot3': None, 'P99_or_Bot2': None, 'Max_or_Bot1': None
+        }]
+        
+        pd.DataFrame(error_result).to_csv(filepath, index=False)
+        logger.error(f"{table_name} | TABLE_ERROR | {error_msg}")
+        return filepath
+    except Exception as e:
+        logger.error(f"{table_name} error result failed: {e}")
+        raise
 
 def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
               target_sample_size: int = 2_000_000) -> Dict[str, str]:
