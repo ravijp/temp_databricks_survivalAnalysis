@@ -129,17 +129,29 @@ def _setup_logger(output_path = "/dbfs/tmp/edd"):
         return logger
 
 logger = _setup_logger()
-
 def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
-                filter_condition: Optional[str] = None, 
-                target_sample_size: int = 2_000_000) -> str:
-    """Generate EDD for single table with enhanced robustness"""
+                 col_list: Optional[List[str]] = None,
+                 filter_condition: Optional[str] = None, 
+                 target_sample_size: int = 2_000_000) -> str:
+    """Generate EDD for table with optional column selection and enhanced robustness"""
     
     start_time = time.time()
     
-    # Table access protection
+    # Table access and column validation
     try:
         df = spark.table(table_name)
+        all_columns = df.columns
+        
+        # Column validation and selection
+        if col_list:
+            missing_cols = [col for col in col_list if col not in all_columns]
+            if missing_cols:
+                raise ValueError(f"Columns not found: {missing_cols}")
+            df = df.select(col_list)
+            col_info = f"{len(col_list)} selected columns"
+        else:
+            col_info = f"{len(all_columns)} columns"
+            
     except Exception as e:
         return _build_table_error_result(table_name, str(e))
     
@@ -155,146 +167,190 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
     if total_rows == 0:
         return _build_empty_table_result(table_name)
     
-    # Three-tier sampling strategy with TABLESAMPLE fallback
+    # Optimized three-tier sampling strategy
     if total_rows <= 2_000_000:
-        # Tier 1: Use full dataset (≤2M rows)
-        df_to_analyze = df
-        actual_sample_size = total_rows
-        sampling_method = "Full Dataset"
-        
+        df_to_analyze, actual_sample_size, sampling_method = df, total_rows, "Full Dataset"
     elif total_rows <= 20_000_000:
-        # Tier 2: Standard random sampling (2M-20M rows)
         sample_rate = target_sample_size / total_rows
         df_to_analyze = df.sample(sample_rate, seed=42)
         actual_sample_size = df_to_analyze.count()
         sampling_method = f"Random Sample ({sample_rate:.4f})"
-        
     else:
-        # Tier 3: TABLESAMPLE for large tables (20M+ rows) with fallback
+        # TABLESAMPLE with fallback
         try:
-            table_sql = f"SELECT * FROM {table_name}"
+            cols_str = ", ".join(col_list) if col_list else "*"
+            table_sql = f"SELECT {cols_str} FROM {table_name}"
             if filter_condition:
                 table_sql += f" WHERE {filter_condition}"
             table_sql += f" TABLESAMPLE({target_sample_size} ROWS)"
             
             df_to_analyze = spark.sql(table_sql)
-            actual_sample_size = target_sample_size  # TABLESAMPLE gives exact count
+            actual_sample_size = target_sample_size
             sampling_method = f"TABLESAMPLE ({target_sample_size:,} rows)"
         except Exception as e:
-            # TABLESAMPLE fallback to regular sampling
             sample_rate = target_sample_size / total_rows
             df_to_analyze = df.sample(sample_rate, seed=42)
             actual_sample_size = df_to_analyze.count()
             sampling_method = f"Sample Fallback ({sample_rate:.4f})"
-            logger.warning(f"TABLESAMPLE failed for {table_name}, using regular sampling: {e}")
+            logger.warning(f"TABLESAMPLE failed for {table_name}: {e}")
     
-    print(f"  → Sampling: {sampling_method}")
-    
+    print(f"  → {sampling_method}")
     df_to_analyze.cache()
     columns = df_to_analyze.columns
     
-    # Schema classification - now returns 5 types
-    numeric_columns, categorical_columns, temporal_columns, boolean_columns, complex_columns = _classify_columns_by_schema(df_to_analyze)
+    # Schema classification and stats collection
+    numeric_cols, categorical_cols, temporal_cols, boolean_cols, complex_cols = _classify_columns_by_schema(df_to_analyze)
     
-    # Print column type summary
-    type_summary = f"Column types: {len(numeric_columns)} Numeric, {len(categorical_columns)} Categorical"
-    if temporal_columns:
-        type_summary += f", {len(temporal_columns)} Temporal"
-    if boolean_columns:
-        type_summary += f", {len(boolean_columns)} Boolean"  
-    if complex_columns:
-        type_summary += f", {len(complex_columns)} Complex"
+    type_counts = [len(numeric_cols), len(categorical_cols), len(temporal_cols), len(boolean_cols), len(complex_cols)]
+    type_names = ["Numeric", "Categorical", "Temporal", "Boolean", "Complex"]
+    type_summary = ", ".join(f"{count} {name}" for count, name in zip(type_counts, type_names) if count > 0)
     print(f"  → {type_summary}")
     
-    # Batch statistics
-    null_exprs = [count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns]
-    null_counts = df_to_analyze.select(null_exprs).collect()[0].asDict()
+    # Batch statistics - optimized single pass
+    batch_exprs = []
+    batch_exprs.extend([count(when(col(c).isNull(), c)).alias(f"null_{c}") for c in columns])
+    batch_exprs.extend([approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns])
+    batch_stats = df_to_analyze.select(batch_exprs).collect()[0].asDict()
     
-    unique_exprs = [approx_count_distinct(col(c)).alias(f"unique_{c}") for c in columns]
-    unique_counts = df_to_analyze.select(unique_exprs).collect()[0].asDict()
+    # Type-specific statistics
+    stats_map = {
+        'numeric': _get_batch_numeric_stats(df_to_analyze, numeric_cols) if numeric_cols else {},
+        'temporal': _get_temporal_stats(df_to_analyze, temporal_cols) if temporal_cols else {},
+        'boolean': _get_boolean_stats(df_to_analyze, boolean_cols) if boolean_cols else {},
+        'complex': _get_complex_stats(df_to_analyze, complex_cols) if complex_cols else {}
+    }
     
-    # Get statistics for each column type
-    numeric_stats = _get_batch_numeric_stats(df_to_analyze, numeric_columns) if numeric_columns else {}
-    temporal_stats = _get_temporal_stats(df_to_analyze, temporal_columns) if temporal_columns else {}
-    boolean_stats = _get_boolean_stats(df_to_analyze, boolean_columns) if boolean_columns else {}
-    complex_stats = _get_complex_stats(df_to_analyze, complex_columns) if complex_columns else {}
-    
-    # Build results - ensure every column is processed
+    # Build results - streamlined processing
     results = []
-    processed_columns = set()
-    
     for i, col_name in enumerate(columns, 1):
         try:
-            null_count = null_counts[f"null_{col_name}"]
-            unique_count = unique_counts[f"unique_{col_name}"]
+            null_count = batch_stats[f"null_{col_name}"]
+            unique_count = batch_stats[f"unique_{col_name}"]
             non_null_count = actual_sample_size - null_count
             
-            # Route to appropriate result builder based on column type
-            if col_name in numeric_columns:
+            # Route to appropriate result builder
+            if col_name in numeric_cols:
                 result = _build_numeric_result(i, col_name, total_rows, actual_sample_size, 
                                              null_count, non_null_count, unique_count, 
-                                             numeric_stats.get(col_name, {}))
-            elif col_name in temporal_columns:
+                                             stats_map['numeric'].get(col_name, {}))
+            elif col_name in temporal_cols:
                 result = _build_temporal_result(i, col_name, total_rows, actual_sample_size,
                                               null_count, non_null_count, unique_count,
-                                              temporal_stats.get(col_name, {}))
-                # If temporal processing failed, fallback to categorical
-                if result is None:
-                    result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, actual_sample_size,
-                                                     null_count, non_null_count, unique_count)
-            elif col_name in boolean_columns:
+                                              stats_map['temporal'].get(col_name, {}))
+                if result is None:  # Fallback to categorical
+                    result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, 
+                                                     actual_sample_size, null_count, non_null_count, unique_count)
+            elif col_name in boolean_cols:
                 result = _build_boolean_result(i, col_name, total_rows, actual_sample_size,
                                              null_count, non_null_count, unique_count,
-                                             boolean_stats.get(col_name, {}))
-            elif col_name in complex_columns:
+                                             stats_map['boolean'].get(col_name, {}))
+            elif col_name in complex_cols:
                 result = _build_complex_result(i, col_name, total_rows, actual_sample_size,
                                              null_count, non_null_count, unique_count,
-                                             complex_stats.get(col_name, {}))
+                                             stats_map['complex'].get(col_name, {}))
             else:
-                # Default to categorical for any unclassified columns
-                result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, actual_sample_size,
-                                                 null_count, non_null_count, unique_count)
+                result = _build_categorical_result(df_to_analyze, i, col_name, total_rows, 
+                                                 actual_sample_size, null_count, non_null_count, unique_count)
             
             results.append(result)
-            processed_columns.add(col_name)
             
         except Exception as e:
-            # Ensure failed columns still appear in output
             logger.error(f"{table_name}.{col_name} failed: {e}")
-            error_result = _build_error_result(i, col_name, total_rows, actual_sample_size, str(e))
-            results.append(error_result)
-            processed_columns.add(col_name)
-    
-    # Check for any missed columns
-    missing_columns = set(columns) - processed_columns
-    if missing_columns:
-        logger.error(f"Missing columns: {missing_columns}")
-        for missed_col in missing_columns:
-            col_index = columns.index(missed_col) + 1
-            error_result = _build_error_result(col_index, missed_col, total_rows, actual_sample_size, 
-                                             "Column missed in processing")
-            results.append(error_result)
+            results.append(_build_error_result(i, col_name, total_rows, actual_sample_size, str(e)))
     
     df_to_analyze.unpersist()
     
-    # Save results
+    # Save results with optimized filename
     os.makedirs(output_path, exist_ok=True)
     timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
-    filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
+    
+    suffix = f"_cols_{len(col_list)}" if col_list and len(col_list) < len(all_columns) else ""
+    filename = f"{table_name.replace('.', '_')}_edd{suffix}_{timestamp}.csv"
     filepath = os.path.join(output_path, filename)
     
     try:
         pd.DataFrame(results).to_csv(filepath, index=False)
         elapsed_min = (time.time() - start_time) / 60
         
-        # Log to file for audit
-        logger.info(f"{table_name} | {total_rows:,} rows | {len(columns)} cols | {elapsed_min:.1f}m | {os.path.basename(filepath)}")
-        
+        logger.info(f"{table_name} | {total_rows:,} rows | {col_info} | {elapsed_min:.1f}m | {os.path.basename(filepath)}")
         return filepath
         
     except Exception as e:
         logger.error(f"{table_name} save failed: {e}")
         raise
+
+
+def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
+              col_list: Optional[List[str]] = None,
+              target_sample_size: int = 2_000_000) -> Dict[str, str]:
+    """Process multiple tables with optional column selection using optimized three-tier sampling"""
+    
+    col_info = f" with {len(col_list)} columns" if col_list else ""
+    print(f"Starting batch EDD: {len(table_list)} tables{col_info}")
+    print(f"Sampling: ≤2M=Full, 2M-20M=Random, 20M+=TABLESAMPLE({target_sample_size:,})")
+    logger.info(f"BATCH START | {len(table_list)} tables{col_info}")
+    
+    batch_start = time.time()
+    results = {}
+    summary_data = []
+    
+    for i, table_name in enumerate(table_list, 1):
+        print(f"[{i}/{len(table_list)}] {table_name}")
+        
+        try:
+            table_start = time.time()
+            
+            # Quick info check
+            temp_df = spark.table(table_name)
+            if col_list:
+                temp_df = temp_df.select(col_list)
+            total_rows = temp_df.count()
+            num_cols = len(temp_df.columns)
+            print(f"  → {total_rows:,} rows, {num_cols} columns")
+            
+            # Generate EDD
+            filepath = generate_edd(table_name, output_path, col_list, 
+                                  target_sample_size=target_sample_size)
+            elapsed = time.time() - table_start
+            
+            results[table_name] = filepath
+            print(f"  → Completed in {elapsed/60:.1f}min")
+            
+            summary_data.append({
+                'Table_Name': table_name, 'Status': 'Success', 'File_Path': filepath,
+                'Rows': total_rows, 'Columns': num_cols, 'Processing_Minutes': round(elapsed/60, 2)
+            })
+            
+        except Exception as e:
+            error_msg = str(e)
+            results[table_name] = f"FAILED: {error_msg}"
+            print(f"  → FAILED: {error_msg}")
+            logger.error(f"{table_name} | FAILED | {error_msg}")
+            
+            summary_data.append({
+                'Table_Name': table_name, 'Status': 'Failed', 'File_Path': '',
+                'Rows': 0, 'Columns': 0, 'Processing_Minutes': 0, 'Error': error_msg
+            })
+    
+    # Save batch summary
+    timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
+    summary_file = os.path.join(output_path, f"batch_summary_{timestamp}.csv")
+    
+    try:
+        pd.DataFrame(summary_data).to_csv(summary_file, index=False)
+    except Exception as e:
+        logger.error(f"Summary save failed: {e}")
+    
+    # Final summary
+    successful = sum(1 for r in results.values() if r.endswith('.csv'))
+    total_minutes = (time.time() - batch_start) / 60
+    
+    print(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_minutes:.1f} minutes")
+    logger.info(f"BATCH END | {successful}/{len(table_list)} success | {total_minutes:.1f}m")
+    
+    return results
+
+
 
 def _classify_columns_by_schema(df) -> tuple[List[str], List[str], List[str], List[str], List[str]]:
     """Classify columns by Spark schema types into 5 categories"""
@@ -901,71 +957,6 @@ def _build_table_error_result(table_name: str, error_msg: str, output_path = "/d
         logger.error(f"{table_name} error result failed: {e}")
         raise
 
-def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
-              target_sample_size: int = 2_000_000) -> Dict[str, str]:
-    """Process multiple tables with three-tier sampling strategy"""
-    
-    print(f"Starting batch EDD: {len(table_list)} tables")
-    print(f"Sampling strategy: ≤2M=Full, 2M-20M=Random, 20M+=TABLESAMPLE({target_sample_size:,})")
-    logger.info(f"BATCH START | {len(table_list)} tables")
-    
-    batch_start = time.time()
-    results = {}
-    summary_data = []
-    
-    for i, table_name in enumerate(table_list, 1):
-        print(f"[{i}/{len(table_list)}] {table_name}")
-        
-        try:
-            table_start = time.time()
-            
-            # Get basic info for console
-            df = spark.table(table_name)
-            total_rows = df.count()
-            num_cols = len(df.columns)
-            print(f"  → {total_rows:,} rows, {num_cols} columns")
-            
-            # Generate EDD
-            filepath = generate_edd(table_name, output_path, target_sample_size=target_sample_size)
-            elapsed = time.time() - table_start
-            
-            results[table_name] = filepath
-            print(f"  → Completed in {elapsed/60:.1f}min")
-            
-            summary_data.append({
-                'Table_Name': table_name, 'Status': 'Success', 'File_Path': filepath,
-                'Rows': total_rows, 'Columns': num_cols, 'Processing_Minutes': round(elapsed/60, 2)
-            })
-            
-        except Exception as e:
-            error_msg = str(e)
-            results[table_name] = f"FAILED: {error_msg}"
-            print(f"  → FAILED: {error_msg}")
-            logger.error(f"{table_name} | FAILED | {error_msg}")
-            
-            summary_data.append({
-                'Table_Name': table_name, 'Status': 'Failed', 'File_Path': '',
-                'Rows': 0, 'Columns': 0, 'Processing_Minutes': 0, 'Error': error_msg
-            })
-    
-    # Save batch summary
-    timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
-    summary_file = os.path.join(output_path, f"batch_summary_{timestamp}.csv")
-    
-    try:
-        pd.DataFrame(summary_data).to_csv(summary_file, index=False)
-    except Exception as e:
-        logger.error(f"Summary save failed: {e}")
-    
-    # Final summary
-    successful = sum(1 for r in results.values() if r.endswith('.csv'))
-    total_minutes = (time.time() - batch_start) / 60
-    
-    print(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_minutes:.1f} minutes")
-    logger.info(f"BATCH END | {successful}/{len(table_list)} success | {total_minutes:.1f}m")
-    
-    return results
-
 # Utility functions
 def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
     """List generated EDD files"""
@@ -1043,3 +1034,17 @@ if __name__ == "__main__":
     print("Main: generate_edd(table) | batch_edd([tables])")  
     print("Utils: list_edd_files() | show_schema_classification(table) | view_log_file()")
     print("Enhanced fields: Total_Rows, Sample_Size, Outlier_Count, Distribution_Shape")
+
+
+# Usage examples:
+# All columns (same as original)
+# filepath = generate_edd("my_table")
+
+# Specific columns with validation
+# filepath = generate_edd("my_table", col_list=["col1", "col2", "col3"])
+
+# With filter condition
+# filepath = generate_edd("my_table", col_list=["date_col", "amount"], filter_condition="year > 2020")
+
+# Batch processing - all tables with same column selection
+# results = batch_edd(["table1", "table2", "table3"], col_list=["common_col1", "common_col2"])
