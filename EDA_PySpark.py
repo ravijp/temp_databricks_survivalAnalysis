@@ -7,11 +7,7 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
-
-import pandas as pd
-import os
 import glob
-import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -91,13 +87,9 @@ def run_edd_error_analysis():
     
     logger.info(f"Analysis complete. Results saved to {output_path}")
 
-# Call this function to run the analysis
-# run_edd_error_analysis()
-
 def _setup_logger(output_path = "/dbfs/tmp/edd"):
     """Setup file-only logger for audit trail"""
     try:
-        
         log_dir = os.path.join(output_path, "logs")
         os.makedirs(log_dir, exist_ok=True)
         
@@ -129,6 +121,7 @@ def _setup_logger(output_path = "/dbfs/tmp/edd"):
         return logger
 
 logger = _setup_logger()
+
 def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
                  col_list: Optional[List[str]] = None,
                  filter_condition: Optional[str] = None, 
@@ -279,7 +272,6 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         logger.error(f"{table_name} save failed: {e}")
         raise
 
-
 def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
               col_list: Optional[List[str]] = None,
               target_sample_size: int = 2_000_000) -> Dict[str, str]:
@@ -349,8 +341,6 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
     logger.info(f"BATCH END | {successful}/{len(table_list)} success | {total_minutes:.1f}m")
     
     return results
-
-
 
 def _classify_columns_by_schema(df) -> tuple[List[str], List[str], List[str], List[str], List[str]]:
     """Classify columns by Spark schema types into 5 categories"""
@@ -445,7 +435,7 @@ def _get_batch_numeric_stats(df, numeric_columns: List[str]) -> Dict:
             combined_stats[col_name] = {'error': str(e)}
     
     return combined_stats
-    
+
 def _classify_numeric_distribution(mean: Optional[float], median: Optional[float]) -> str:
     """Classify numeric distribution shape"""
     if mean is None or median is None:
@@ -461,6 +451,16 @@ def _classify_numeric_distribution(mean: Optional[float], median: Optional[float
         return "Normal"
     else:
         return "Skewed"
+
+def _safe_float(value) -> Optional[float]:
+    """Convert to float, handle inf/nan"""
+    try:
+        f_val = float(value)
+        if f_val == float('inf') or f_val == float('-inf') or f_val != f_val:
+            return None
+        return round(f_val, 6)
+    except:
+        return None
 
 def _build_temporal_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
                           null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
@@ -746,30 +746,6 @@ def _get_complex_stats(df, complex_columns: List[str]) -> Dict:
             complex_stats[col_name] = {'error': str(e)}
     
     return complex_stats
-    """Classify numeric distribution shape"""
-    if mean is None or median is None:
-        return "Unknown"
-    
-    if median == 0:
-        return "Skewed" if abs(mean) > 0.1 else "Normal"
-    
-    # Calculate relative difference
-    relative_diff = abs(mean - median) / abs(median)
-    
-    if relative_diff < 0.1:
-        return "Normal"
-    else:
-        return "Skewed"
-
-def _safe_float(value) -> Optional[float]:
-    """Convert to float, handle inf/nan"""
-    try:
-        f_val = float(value)
-        if f_val == float('inf') or f_val == float('-inf') or f_val != f_val:
-            return None
-        return round(f_val, 6)
-    except:
-        return None
 
 def _build_numeric_result(field_num: int, column_name: str, total_rows: int, sample_size: int,
                          null_count: int, non_null_count: int, unique_count: int, stats: Dict) -> Dict:
@@ -911,7 +887,6 @@ def _build_error_result(field_num: int, column_name: str, total_rows: int, sampl
 def _build_empty_table_result(table_name: str, output_path = "/dbfs/tmp/edd") -> str:
     """Build result file for empty tables"""
     try:
-        
         os.makedirs(output_path, exist_ok=True)
         timestamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d_%H%M%S")
         filename = f"{table_name.replace('.', '_')}_edd_{timestamp}.csv"
@@ -1028,23 +1003,22 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("Enhanced EDD System v9 Ready")
+    print("Enhanced EDD System v10 Ready")
     print("Column Types: Numeric | Categorical | Temporal | Boolean | Complex")
     print("Sampling: ≤2M=Full Data | 2M-20M=Random Sample | 20M+=TABLESAMPLE")
-    print("Main: generate_edd(table) | batch_edd([tables])")  
+    print("Main: generate_edd(table, col_list=None) | batch_edd([tables], col_list=None)")  
     print("Utils: list_edd_files() | show_schema_classification(table) | view_log_file()")
     print("Enhanced fields: Total_Rows, Sample_Size, Outlier_Count, Distribution_Shape")
 
-
 # Usage examples:
-# All columns (same as original)
+# All columns (backward compatible)
 # filepath = generate_edd("my_table")
 
-# Specific columns with validation
+# Specific columns with automatic validation
 # filepath = generate_edd("my_table", col_list=["col1", "col2", "col3"])
 
 # With filter condition
 # filepath = generate_edd("my_table", col_list=["date_col", "amount"], filter_condition="year > 2020")
 
-# Batch processing - all tables with same column selection
-# results = batch_edd(["table1", "table2", "table3"], col_list=["common_col1", "common_col2"])
+# Batch processing with column selection
+# results = batch_edd(["table1", "table2"], col_list=["common_col1", "common_col2"])
