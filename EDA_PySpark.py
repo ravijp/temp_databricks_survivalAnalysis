@@ -122,18 +122,41 @@ def _setup_logger(output_path = "/dbfs/tmp/edd"):
 
 logger = _setup_logger()
 
-def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd", 
+def generate_edd(source, output_path: str = "/dbfs/tmp/edd", 
                  col_list: Optional[List[str]] = None,
                  filter_condition: Optional[str] = None, 
-                 target_sample_size: int = 2_000_000) -> str:
-    """Generate EDD for table with optional column selection and enhanced robustness"""
+                 target_sample_size: int = 2_000_000,
+                 df_name: Optional[str] = None) -> str:
+    """Generate EDD for table or DataFrame with optional column selection and enhanced robustness
+    
+    Args:
+        source: Either table name (str) or PySpark DataFrame
+        output_path: Directory to save EDD files
+        col_list: Optional list of specific columns to analyze
+        filter_condition: Optional filter condition (only works with table names)
+        target_sample_size: Target sample size for large datasets
+        df_name: Optional name for DataFrame (used in logging/filename, defaults to 'dataframe')
+    """
     
     start_time = time.time()
     
-    # Table access and column validation
+    # Determine if source is DataFrame or table name
+    is_dataframe = hasattr(source, 'columns')  # Check if it's a DataFrame
+    
+    # Table/DataFrame access and column validation
     try:
-        df = spark.table(table_name)
-        all_columns = df.columns
+        if is_dataframe:
+            df = source
+            table_name = df_name or "dataframe"
+            all_columns = df.columns
+            
+            if filter_condition:
+                print("  ⚠️  Warning: filter_condition ignored for DataFrame input - apply filters before passing DataFrame")
+        else:
+            # Traditional table access
+            table_name = source
+            df = spark.table(table_name)
+            all_columns = df.columns
         
         # Column validation and selection
         if col_list:
@@ -146,10 +169,10 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
             col_info = f"{len(all_columns)} columns"
             
     except Exception as e:
-        return _build_table_error_result(table_name, str(e))
+        return _build_table_error_result(table_name if not is_dataframe else (df_name or "dataframe"), str(e))
     
-    # Apply filter if provided
-    if filter_condition:
+    # Apply filter if provided (only for table names, not DataFrames)
+    if filter_condition and not is_dataframe:
         try:
             df = df.filter(filter_condition)
         except Exception as e:
@@ -169,23 +192,30 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         actual_sample_size = df_to_analyze.count()
         sampling_method = f"Random Sample ({sample_rate:.4f})"
     else:
-        # TABLESAMPLE with fallback
-        try:
-            cols_str = ", ".join(col_list) if col_list else "*"
-            table_sql = f"SELECT {cols_str} FROM {table_name}"
-            if filter_condition:
-                table_sql += f" WHERE {filter_condition}"
-            table_sql += f" TABLESAMPLE({target_sample_size} ROWS)"
-            
-            df_to_analyze = spark.sql(table_sql)
-            actual_sample_size = target_sample_size
-            sampling_method = f"TABLESAMPLE ({target_sample_size:,} rows)"
-        except Exception as e:
+        # TABLESAMPLE with fallback (only for table names, not DataFrames)
+        if not is_dataframe:
+            try:
+                cols_str = ", ".join(col_list) if col_list else "*"
+                table_sql = f"SELECT {cols_str} FROM {table_name}"
+                if filter_condition:
+                    table_sql += f" WHERE {filter_condition}"
+                table_sql += f" TABLESAMPLE({target_sample_size} ROWS)"
+                
+                df_to_analyze = spark.sql(table_sql)
+                actual_sample_size = target_sample_size
+                sampling_method = f"TABLESAMPLE ({target_sample_size:,} rows)"
+            except Exception as e:
+                sample_rate = target_sample_size / total_rows
+                df_to_analyze = df.sample(sample_rate, seed=42)
+                actual_sample_size = df_to_analyze.count()
+                sampling_method = f"Sample Fallback ({sample_rate:.4f})"
+                logger.warning(f"TABLESAMPLE failed for {table_name}: {e}")
+        else:
+            # For DataFrames, use regular sampling
             sample_rate = target_sample_size / total_rows
             df_to_analyze = df.sample(sample_rate, seed=42)
             actual_sample_size = df_to_analyze.count()
-            sampling_method = f"Sample Fallback ({sample_rate:.4f})"
-            logger.warning(f"TABLESAMPLE failed for {table_name}: {e}")
+            sampling_method = f"DataFrame Sample ({sample_rate:.4f})"
     
     print(f"  → {sampling_method}")
     df_to_analyze.cache()
@@ -272,56 +302,91 @@ def generate_edd(table_name: str, output_path: str = "/dbfs/tmp/edd",
         logger.error(f"{table_name} save failed: {e}")
         raise
 
-def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd", 
+def batch_edd(source_list: List, output_path: str = "/dbfs/tmp/edd", 
               col_list: Optional[List[str]] = None,
               target_sample_size: int = 2_000_000) -> Dict[str, str]:
-    """Process multiple tables with optional column selection using optimized three-tier sampling"""
+    """Process multiple tables/DataFrames with optional column selection using optimized three-tier sampling
+    
+    Args:
+        source_list: List of table names (str) or tuples (DataFrame, name) or mixed
+        output_path: Directory to save EDD files
+        col_list: Optional list of columns to analyze (applied to all sources)
+        target_sample_size: Target sample size for large datasets
+    """
     
     col_info = f" with {len(col_list)} columns" if col_list else ""
-    print(f"Starting batch EDD: {len(table_list)} tables{col_info}")
+    print(f"Starting batch EDD: {len(source_list)} sources{col_info}")
     print(f"Sampling: ≤2M=Full, 2M-20M=Random, 20M+=TABLESAMPLE({target_sample_size:,})")
-    logger.info(f"BATCH START | {len(table_list)} tables{col_info}")
+    logger.info(f"BATCH START | {len(source_list)} sources{col_info}")
     
     batch_start = time.time()
     results = {}
     summary_data = []
     
-    for i, table_name in enumerate(table_list, 1):
-        print(f"[{i}/{len(table_list)}] {table_name}")
+    for i, source in enumerate(source_list, 1):
+        # Handle different source types
+        if isinstance(source, tuple):
+            # (DataFrame, name) tuple
+            df, source_name = source
+            is_dataframe = True
+        elif hasattr(source, 'columns'):
+            # DataFrame without name
+            df, source_name = source, f"dataframe_{i}"
+            is_dataframe = True
+        else:
+            # Table name string
+            source_name = source
+            is_dataframe = False
+        
+        print(f"[{i}/{len(source_list)}] {source_name}")
         
         try:
             table_start = time.time()
             
             # Quick info check
-            temp_df = spark.table(table_name)
-            if col_list:
-                temp_df = temp_df.select(col_list)
-            total_rows = temp_df.count()
-            num_cols = len(temp_df.columns)
+            if is_dataframe:
+                temp_df = df
+                if col_list:
+                    temp_df = df.select(col_list)
+                total_rows = temp_df.count()
+                num_cols = len(temp_df.columns)
+            else:
+                temp_df = spark.table(source_name)
+                if col_list:
+                    temp_df = temp_df.select(col_list)
+                total_rows = temp_df.count()
+                num_cols = len(temp_df.columns)
+            
             print(f"  → {total_rows:,} rows, {num_cols} columns")
             
             # Generate EDD
-            filepath = generate_edd(table_name, output_path, col_list, 
-                                  target_sample_size=target_sample_size)
-            elapsed = time.time() - table_start
+            if is_dataframe:
+                filepath = generate_edd(df, output_path, col_list, 
+                                      target_sample_size=target_sample_size, df_name=source_name)
+            else:
+                filepath = generate_edd(source_name, output_path, col_list, 
+                                      target_sample_size=target_sample_size)
             
-            results[table_name] = filepath
+            elapsed = time.time() - table_start
+            results[source_name] = filepath
             print(f"  → Completed in {elapsed/60:.1f}min")
             
             summary_data.append({
-                'Table_Name': table_name, 'Status': 'Success', 'File_Path': filepath,
-                'Rows': total_rows, 'Columns': num_cols, 'Processing_Minutes': round(elapsed/60, 2)
+                'Source_Name': source_name, 'Source_Type': 'DataFrame' if is_dataframe else 'Table',
+                'Status': 'Success', 'File_Path': filepath, 'Rows': total_rows, 
+                'Columns': num_cols, 'Processing_Minutes': round(elapsed/60, 2)
             })
             
         except Exception as e:
             error_msg = str(e)
-            results[table_name] = f"FAILED: {error_msg}"
+            results[source_name] = f"FAILED: {error_msg}"
             print(f"  → FAILED: {error_msg}")
-            logger.error(f"{table_name} | FAILED | {error_msg}")
+            logger.error(f"{source_name} | FAILED | {error_msg}")
             
             summary_data.append({
-                'Table_Name': table_name, 'Status': 'Failed', 'File_Path': '',
-                'Rows': 0, 'Columns': 0, 'Processing_Minutes': 0, 'Error': error_msg
+                'Source_Name': source_name, 'Source_Type': 'DataFrame' if is_dataframe else 'Table',
+                'Status': 'Failed', 'File_Path': '', 'Rows': 0, 'Columns': 0, 
+                'Processing_Minutes': 0, 'Error': error_msg
             })
     
     # Save batch summary
@@ -337,8 +402,8 @@ def batch_edd(table_list: List[str], output_path: str = "/dbfs/tmp/edd",
     successful = sum(1 for r in results.values() if r.endswith('.csv'))
     total_minutes = (time.time() - batch_start) / 60
     
-    print(f"\nBatch completed: {successful}/{len(table_list)} successful in {total_minutes:.1f} minutes")
-    logger.info(f"BATCH END | {successful}/{len(table_list)} success | {total_minutes:.1f}m")
+    print(f"\nBatch completed: {successful}/{len(source_list)} successful in {total_minutes:.1f} minutes")
+    logger.info(f"BATCH END | {successful}/{len(source_list)} success | {total_minutes:.1f}m")
     
     return results
 
@@ -933,6 +998,10 @@ def _build_table_error_result(table_name: str, error_msg: str, output_path = "/d
         raise
 
 # Utility functions
+def analyze_dataframe(df, name: str = "my_dataframe", **kwargs) -> str:
+    """Convenience function to analyze a DataFrame with a descriptive name"""
+    return generate_edd(df, df_name=name, **kwargs)
+
 def list_edd_files(output_path: str = "/dbfs/tmp/edd") -> None:
     """List generated EDD files"""
     try:
@@ -1003,22 +1072,72 @@ def view_log_file(output_path: str = "/dbfs/tmp/edd") -> None:
         print(f"Error reading log: {e}")
 
 if __name__ == "__main__":
-    print("Enhanced EDD System v10 Ready")
+    print("Enhanced EDD System v11 Ready")
     print("Column Types: Numeric | Categorical | Temporal | Boolean | Complex")
     print("Sampling: ≤2M=Full Data | 2M-20M=Random Sample | 20M+=TABLESAMPLE")
-    print("Main: generate_edd(table, col_list=None) | batch_edd([tables], col_list=None)")  
-    print("Utils: list_edd_files() | show_schema_classification(table) | view_log_file()")
+    print("Main: generate_edd(table/df, col_list=None) | batch_edd([sources], col_list=None)")  
+    print("Utils: analyze_dataframe() | list_edd_files() | show_schema_classification() | view_log_file()")
     print("Enhanced fields: Total_Rows, Sample_Size, Outlier_Count, Distribution_Shape")
 
 # Usage examples:
-# All columns (backward compatible)
+
+# ========== TABLE ANALYSIS ==========
+# All columns from table
 # filepath = generate_edd("my_table")
 
-# Specific columns with automatic validation
+# Specific columns from table with validation
 # filepath = generate_edd("my_table", col_list=["col1", "col2", "col3"])
 
-# With filter condition
+# Table with filter condition
 # filepath = generate_edd("my_table", col_list=["date_col", "amount"], filter_condition="year > 2020")
 
-# Batch processing with column selection
-# results = batch_edd(["table1", "table2"], col_list=["common_col1", "common_col2"])
+# ========== DATAFRAME ANALYSIS ==========
+# After complex transformations
+# df_result = (spark.table("raw_data")
+#              .join(spark.table("lookup"), "key")
+#              .groupBy("category").agg(F.sum("amount").alias("total"))
+#              .filter(F.col("total") > 1000))
+# 
+# # Analyze the resulting DataFrame
+# filepath = generate_edd(df_result, df_name="aggregated_sales")
+
+# Analyze DataFrame with specific columns
+# filepath = generate_edd(df_result, col_list=["category", "total"], df_name="sales_summary")
+
+# Convenience function for DataFrame analysis
+# filepath = analyze_dataframe(df_result, name="final_analysis", col_list=["key_columns"])
+
+# ========== BATCH PROCESSING ==========
+# Mixed table and DataFrame batch processing
+# results = batch_edd([
+#     "table1",                                    # Table name
+#     "table2",                                    # Table name  
+#     (df_result, "my_dataframe"),                # (DataFrame, name) tuple
+#     df_another                                   # DataFrame (auto-named)
+# ], col_list=["common_col1", "common_col2"])
+
+# Pure DataFrame batch
+# results = batch_edd([
+#     (df1, "transformed_data"),
+#     (df2, "joined_data"), 
+#     (df3, "final_output")
+# ])
+
+# Pure table batch (backward compatible)
+# results = batch_edd(["table1", "table2", "table3"], col_list=["col1", "col2"])
+
+# # Complex Workflow Example
+# # 1. Create complex DataFrame
+# final_df = (spark.table("transactions")
+#             .join(spark.table("customers"), "customer_id")
+#             .groupBy("segment", "region")
+#             .agg(F.avg("amount").alias("avg_amount"),
+#                  F.count("*").alias("transaction_count"))
+#             .filter(F.col("transaction_count") > 100))
+
+# # 2. Analyze intermediate result
+# edd_path = generate_edd(final_df, 
+#                        df_name="customer_segment_analysis",
+#                        col_list=["segment", "avg_amount", "transaction_count"])
+
+# # 3. Can now inspect data quality before saving to table
