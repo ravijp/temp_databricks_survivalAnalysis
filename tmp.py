@@ -1,155 +1,115 @@
-pk_analysis = (
-    wass_df
-    .agg(
-        F.count("*").alias("total_records"),
-        F.countDistinct(*pk_cols).alias("unique_keys"),
-        F.countDistinct("pers_obj_id").alias("unique_employees")
-    )
-    .withColumn("duplicate_pct", 
-        ((F.col("total_records") - F.col("unique_keys")) / F.col("total_records") * 100))
-)
-pk_analysis.show()
+import pyspark.sql.functions as F
+from pyspark.sql import DataFrame
 
-# 2. TIME COVERAGE & DATA ARTIFACTS
-print("\n2. TIME COVERAGE ANALYSIS")
-time_analysis = (
-    wass_df
-    .select(
-        F.year("rec_eff_strt_dt").alias("start_year"),
-        F.year("rec_eff_end_dt").alias("end_year")
-    )
-    .agg(
-        # Start date patterns
-        F.min("start_year").alias("min_start_year"),
-        F.max("start_year").alias("max_start_year"),
-        F.sum(F.when(F.col("start_year") < 2000, 1).otherwise(0)).alias("artifact_start_records"),
+def check_duplicates(df: DataFrame, step: str) -> DataFrame:
+    """Check for exact duplicate rows and print summary"""
+    total = df.count()
+    unique = df.distinct().count()
+    duplicates = total - unique
+    
+    print(f"{step}: {total:,} records, {duplicates:,} duplicates")
+    if duplicates > 0:
+        print(f"  WARNING: {duplicates:,} exact duplicate rows detected")
+    
+    return df
+
+def check_join_multiplier(before_df: DataFrame, after_df: DataFrame, join_name: str) -> DataFrame:
+    """Check if join created record multiplication"""
+    before_count = before_df.count()
+    after_count = after_df.count()
+    
+    if after_count > before_count:
+        multiplier = after_count / before_count
+        increase = after_count - before_count
+        print(f"{join_name}: {multiplier:.2f}x multiplier (+{increase:,} records)")
+    
+    return after_df
+
+def check_key_duplicates(df: DataFrame, key_cols: list, step: str) -> DataFrame:
+    """Check for duplicate keys in dataset"""
+    total = df.count()
+    unique_keys = df.select(*key_cols).distinct().count()
+    
+    if total > unique_keys:
+        dup_count = total - unique_keys
+        print(f"{step}: {dup_count:,} duplicate keys for {key_cols}")
         
-        # End date patterns  
-        F.min("end_year").alias("min_end_year"),
-        F.max("end_year").alias("max_end_year"),
-        F.sum(F.when(F.col("end_year") > 2030, 1).otherwise(0)).alias("future_end_records"),
-        F.sum(F.when(F.col("end_year").isNull(), 1).otherwise(0)).alias("null_end_records"),
+        # Show top duplicates
+        duplicates = (df.groupBy(*key_cols)
+                     .count()
+                     .filter(F.col("count") > 1)
+                     .orderBy(F.desc("count"))
+                     .limit(3))
         
-        # Data quality
-        F.sum(F.when(F.col("rec_eff_end_dt") < F.col("rec_eff_strt_dt"), 1).otherwise(0)).alias("invalid_date_logic")
-    )
-)
-time_analysis.show()
+        print("  Top duplicate keys:")
+        duplicates.show(3, truncate=False)
+    
+    return df
 
-# 3. EMPLOYEE DISTRIBUTION & EPISODE PATTERNS
-print("\n3. EMPLOYEE EPISODE PATTERNS")
-employee_stats = (
-    wass_df
-    .groupBy("pers_obj_id")
-    .agg(F.count("*").alias("episode_count"))
-    .agg(
-        F.count("*").alias("total_employees"),
-        F.min("episode_count").alias("min_episodes"),
-        F.max("episode_count").alias("max_episodes"),
-        F.mean("episode_count").alias("avg_episodes"),
-        F.expr("percentile_approx(episode_count, 0.5)").alias("median_episodes"),
-        F.expr("percentile_approx(episode_count, 0.95)").alias("p95_episodes"),
-        F.sum(F.when(F.col("episode_count") > 100, 1).otherwise(0)).alias("employees_over_100_episodes")
-    )
-)
-employee_stats.show()
+def debug_manager_status(mgr_df: DataFrame) -> DataFrame:
+    """Check manager status for duplicate manager-date combinations"""
+    key_cols = ["db_schema", "clnt_obj_id", "mgr_sup_id", "rec_eff_strt_dt", "rec_eff_end_dt"]
+    return check_key_duplicates(mgr_df, key_cols, "manager_status")
 
-# 4. EMPLOYMENT STATUS & BUSINESS LOGIC
-print("\n4. EMPLOYMENT STATUS DISTRIBUTION")
-status_analysis = (
-    wass_df
-    .groupBy("work_asgmt_stus_cd")
-    .agg(
-        F.count("*").alias("record_count"),
-        F.countDistinct("pers_obj_id").alias("unique_employees"),
-        F.sum(F.when(F.col("rec_eff_end_dt").isNull(), 1).otherwise(0)).alias("null_end_dates"),
-        F.sum(F.when(F.year("rec_eff_end_dt") > 2030, 1).otherwise(0)).alias("future_end_dates")
+# Main debugging insertions for the ETL pipeline
+def main() -> None:
+    spark.conf.set("spark.sql.shuffle.partitions", 1200)
+    
+    # Load dimension tables
+    clnt_mstr_df = load_clnt_mstr()
+    pers_dln_df = load_pers_dln_df()
+    job_dln_df = load_job_dln_df()
+    ppfl_dln_df = load_ppfl_dln_df()
+    
+    # Load fact tables
+    wass_base_df = load_wass_base_df()
+    wass_base_df = check_duplicates(wass_base_df, "wass_base")
+    
+    wevt_term_df = load_wevt_term_df()
+    
+    # Join termination events
+    wass_term_df = calc_wass_term_df(wass_base_df=wass_base_df, wevt_term_df=wevt_term_df)
+    wass_term_df = check_duplicates(wass_term_df, "after_termination_join")
+    wass_term_df = check_join_multiplier(wass_base_df, wass_term_df, "termination_join")
+    
+    # Load manager hierarchy
+    mgr_status_df = load_mgr_status_df(wass_term_df=wass_term_df)
+    mgr_status_df = debug_manager_status(mgr_status_df)
+    
+    # Main merge - critical checkpoint
+    print("\nCRITICAL CHECKPOINT: Main data merge")
+    wass_merged_df = calc_wass_merged_df(
+        clnt_mstr_df=clnt_mstr_df,
+        wass_term_df=wass_term_df,
+        pers_dln_df=pers_dln_df,
+        job_dln_df=job_dln_df,
+        mgr_status_df=mgr_status_df,
+        ppfl_dln_df=ppfl_dln_df,
     )
-    .orderBy(F.desc("record_count"))
-)
-status_analysis.show()
-
-# 5. DATA COMPLETENESS FOR CRITICAL FIELDS
-print("\n5. DATA COMPLETENESS CHECK")
-completeness_check = (
-    wass_df
-    .agg(
-        F.count("*").alias("total_records"),
-        
-        # Critical fields for modeling
-        (F.sum(F.when(F.col("job_cd").isin("UNKNOWN", ""), 1).when(F.col("job_cd").isNull(), 1).otherwise(0)) 
-         / F.count("*") * 100).alias("job_cd_missing_pct"),
-        
-        (F.sum(F.when(F.col("mngr_pers_obj_id").isin("UNKNOWN", ""), 1).when(F.col("mngr_pers_obj_id").isNull(), 1).otherwise(0)) 
-         / F.count("*") * 100).alias("manager_missing_pct"),
-        
-        (F.sum(F.when(F.col("annl_cmpn_amt").isNull(), 1).when(F.col("annl_cmpn_amt") == 0, 1).otherwise(0)) 
-         / F.count("*") * 100).alias("salary_missing_pct"),
-        
-        (F.sum(F.when(F.col("pay_rt_type_cd").isin("UNKNOWN", ""), 1).when(F.col("pay_rt_type_cd").isNull(), 1).otherwise(0)) 
-         / F.count("*") * 100).alias("paytype_missing_pct")
+    
+    wass_merged_df = check_duplicates(wass_merged_df, "after_main_merge")
+    wass_merged_df = check_join_multiplier(wass_term_df, wass_merged_df, "main_merge")
+    
+    # Team aggregations
+    team_age_df = calc_team_agg_df(wass_merged_df=wass_merged_df)
+    
+    # Final join
+    wass_final_df = wass_merged_df.join(
+        team_age_df, 
+        on=["db_schema", "clnt_obj_id", "pers_obj_id", "work_asgmt_nbr", "rec_eff_strt_dt"], 
+        how="left"
     )
-)
-completeness_check.show()
+    
+    # Final validation
+    wass_final_df = check_duplicates(wass_final_df, "final_output")
+    
+    print(f"\nFinal summary: {wass_final_df.count():,} total records")
+    unique_employees = wass_final_df.select("clnt_obj_id", "pers_obj_id").distinct().count()
+    print(f"Unique employees: {unique_employees:,}")
+    
+# Quick one-liner debugging functions
+def dup_check(df, name): 
+    return check_duplicates(df, name)
 
-# 6. CLIENT CONCENTRATION ANALYSIS
-print("\n6. CLIENT/COMPANY DISTRIBUTION")
-client_stats = (
-    wass_df
-    .groupBy("clnt_obj_id")
-    .agg(
-        F.count("*").alias("record_count"),
-        F.countDistinct("pers_obj_id").alias("employee_count")
-    )
-    .agg(
-        F.count("*").alias("total_clients"),
-        F.max("record_count").alias("max_records_per_client"),
-        F.max("employee_count").alias("max_employees_per_client"),
-        F.sum(F.when(F.col("employee_count") > 1000, 1).otherwise(0)).alias("large_clients_1000plus"),
-        F.sum(F.when(F.col("employee_count") > 10000, 1).otherwise(0)).alias("xlarge_clients_10000plus")
-    )
-)
-client_stats.show()
-
-# 7. SOURCE SYSTEM COVERAGE
-print("\n7. SOURCE SYSTEM DISTRIBUTION")
-source_stats = (
-    wass_df
-    .groupBy("db_schema")
-    .agg(
-        F.count("*").alias("record_count"),
-        F.countDistinct("pers_obj_id").alias("employee_count"),
-        F.countDistinct("clnt_obj_id").alias("client_count")
-    )
-    .orderBy(F.desc("record_count"))
-)
-source_stats.show()
-
-# 8. RECENT DATA QUALITY (Focus on 2020+)
-print("\n8. RECENT DATA QUALITY (2020+)")
-recent_quality = (
-    wass_df
-    .filter(F.year("rec_eff_strt_dt") >= 2020)
-    .agg(
-        F.count("*").alias("recent_records"),
-        F.countDistinct("pers_obj_id").alias("recent_employees"),
-        
-        # Completeness in recent data
-        (F.sum(F.when(F.col("job_cd").isin("UNKNOWN", ""), 1).when(F.col("job_cd").isNull(), 1).otherwise(0)) 
-         / F.count("*") * 100).alias("recent_job_missing_pct"),
-        
-        (F.sum(F.when(F.col("annl_cmpn_amt").isNull(), 1).when(F.col("annl_cmpn_amt") == 0, 1).otherwise(0)) 
-         / F.count("*") * 100).alias("recent_salary_missing_pct")
-    )
-)
-recent_quality.show()
-
-print("\n=== SUMMARY INSIGHTS ===")
-print("✓ Check duplicate percentage - should be ~25%")
-print("✓ Identify usable date range (exclude pre-2000 and post-2030)")
-print("✓ Note employees with excessive episodes (data quality issues)")
-print("✓ Assess field completeness for feature engineering")
-print("✓ Understand client concentration for stratification")
-
-# Unpersist cache
-wass_df.unpersist()
+def join_check(before, after, name): 
+    return check_join_multiplier(before, after, name)
