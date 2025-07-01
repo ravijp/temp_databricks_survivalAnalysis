@@ -18,17 +18,6 @@ def save_dataframe(
     Supports both .transform(function) and .transform(function()) patterns.
     """
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # Direct DataFrame call
-            if args and isinstance(args[0], DataFrame):
-                return _execute_with_save(func, args[0], *args[1:], **kwargs)
-            
-            # Return transform function for .transform() usage
-            def transform_function(df):
-                return _execute_with_save(func, df, *args, **kwargs)
-            return transform_function
-        
         def _execute_with_save(func, df, *args, **kwargs):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
             func_name = func.__name__
@@ -92,6 +81,18 @@ def save_dataframe(
             
             return result_df
         
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Case 1: Called directly with DataFrame (transform(function))
+            if args and isinstance(args[0], DataFrame):
+                return _execute_with_save(func, args[0], *args[1:], **kwargs)
+            
+            # Case 2: Called with no args or non-DataFrame args (transform(function()))
+            # Return a function that transform can call with DataFrame
+            def transform_function(df):
+                return _execute_with_save(func, df, *args, **kwargs)
+            return transform_function
+        
         return wrapper
     return decorator
 
@@ -139,4 +140,3 @@ def standard_transform(df):
 @SaveConfig.get_decorator(max_records=100000)
 def large_transform(df):
     return df.groupBy("category").count()
-
