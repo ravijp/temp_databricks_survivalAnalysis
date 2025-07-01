@@ -114,3 +114,51 @@ def save_dataframe(
         
         return wrapper
     return decorator
+
+
+# Usage examples - same as before
+@save_dataframe(save_path="/tmp/transforms")
+def lower_case_names(df):
+    from pyspark.sql.functions import col
+    return df.select([col(c).alias(c.lower()) for c in df.columns])
+
+@save_dataframe(save_path="/tmp/transforms", max_records_to_save=50000)
+def filter_by_sources(df, sources):
+    from pyspark.sql.functions import col
+    return df.filter(col("source").isin(sources))
+
+@save_dataframe(save_path="/tmp/transforms", when="both")
+def filter_active_records(df, status="active"):
+    from pyspark.sql.functions import col
+    return df.filter(col("status") == status)
+
+# Configuration class
+class SaveConfig:
+    BASE_PATH = "/data/snapshots"
+    FORMAT = "parquet"
+    MAX_RECORDS = 25000
+    
+    @classmethod
+    def get_decorator(cls, when="after", max_records=None):
+        return save_dataframe(
+            save_path=cls.BASE_PATH,
+            save_format=cls.FORMAT,
+            when=when,
+            max_records_to_save=max_records or cls.MAX_RECORDS
+        )
+
+@SaveConfig.get_decorator()
+def standard_transform(df):
+    return df.dropDuplicates()
+
+@SaveConfig.get_decorator(max_records=100000)
+def large_transform(df):
+    return df.groupBy("category").count()
+
+# For use with other decorators like @spark_transform
+# Make sure @save_dataframe is the innermost decorator (closest to the function)
+# Example:
+# @spark_transform
+# @save_dataframe(save_path="/path/to/snapshots", when="both")
+# def with_clean_wass_terminations(df):
+#     return df  # your transformation logic
