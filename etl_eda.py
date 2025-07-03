@@ -32,9 +32,10 @@ class SurvivalDataProcessor:
             concat_ws("_", *self.person_id_cols)
         )
     
+
     def clean_termination_records(self, df: DataFrame,
-                                status_col: str = "work_assgmt_stus_cd",
-                                start_date_col: str = "rec_eff_strt_dt_mod",
+                                status_col: str = "work_asgnmt_stus_cd",
+                                start_date_col: str = "rec_eff_start_dt_mod",
                                 end_date_col: str = "rec_eff_end_dt") -> DataFrame:
         """
         Consolidate consecutive termination records into single episodes
@@ -44,21 +45,21 @@ class SurvivalDataProcessor:
         df_with_id = self.create_composite_person_id(df)
         person_window = Window.partitionBy(self.person_id_combined).orderBy(start_date_col)
         
-        # Identify termination record groups
+        # FIXED: Add col() wrapper around column references
         df_with_groups = df_with_id.withColumn(
             "is_termination", 
             when(col(status_col) == "T", 1).otherwise(0)
         ).withColumn(
             "prev_is_termination", 
-            lag("is_termination").over(person_window)
+            lag(col("is_termination")).over(person_window)
         ).withColumn(
             "termination_group_start",
             when((col("is_termination") == 1) & 
-                 (coalesce(col("prev_is_termination"), lit(0)) == 0), 1)
+                (coalesce(col("prev_is_termination"), lit(0)) == 0), 1)
             .otherwise(0)
         ).withColumn(
             "termination_group_id",
-            sum("termination_group_start").over(
+            sum(col("termination_group_start")).over(
                 person_window.rowsBetween(Window.unboundedPreceding, 0)
             )
         )
@@ -69,8 +70,8 @@ class SurvivalDataProcessor:
         ).groupBy(
             self.person_id_combined, "termination_group_id"
         ).agg(
-            min(start_date_col).alias("group_start_date"),
-            max(end_date_col).alias("group_end_date"),
+            min(col(start_date_col)).alias("group_start_date"),
+            max(col(end_date_col)).alias("group_end_date"),
             count("*").alias("records_in_group"),
             first(struct(*[c for c in df.columns if c not in [start_date_col, end_date_col]]))
             .alias("representative_record")
@@ -94,10 +95,10 @@ class SurvivalDataProcessor:
         return result
     
     def fill_short_gaps(self, df: DataFrame,
-                       status_col: str = "work_assgmt_stus_cd",
-                       start_date_col: str = "rec_eff_strt_dt_mod", 
-                       end_date_col: str = "rec_eff_end_dt",
-                       gap_threshold_days: int = 30) -> DataFrame:
+                    status_col: str = "work_asgnmt_stus_cd",
+                    start_date_col: str = "rec_eff_start_dt_mod", 
+                    end_date_col: str = "rec_eff_end_dt",
+                    gap_threshold_days: int = 30) -> DataFrame:
         """
         Bridge short employment gaps by extending active periods
         Handles administrative terminations and brief unemployment periods
@@ -106,19 +107,19 @@ class SurvivalDataProcessor:
         df_with_id = self.create_composite_person_id(df)
         person_window = Window.partitionBy(self.person_id_combined).orderBy(start_date_col)
         
-        # Add context from adjacent records
+        # FIXED: Add col() wrapper around column references
         df_with_context = df_with_id.withColumn(
-            "prev_status", lag(status_col).over(person_window)
+            "prev_status", lag(col(status_col)).over(person_window)
         ).withColumn(
-            "next_status", lead(status_col).over(person_window)
+            "next_status", lead(col(status_col)).over(person_window)
         ).withColumn(
-            "prev_end_date", lag(end_date_col).over(person_window)
+            "prev_end_date", lag(col(end_date_col)).over(person_window)
         ).withColumn(
-            "next_start_date", lead(start_date_col).over(person_window)
+            "next_start_date", lead(col(start_date_col)).over(person_window)
         ).withColumn(
             "gap_duration",
             when(col(status_col) == "T", 
-                 datediff(col(end_date_col), col(start_date_col)) + 1)
+                datediff(col(end_date_col), col(start_date_col)) + 1)
             .otherwise(0)
         )
         
@@ -136,7 +137,7 @@ class SurvivalDataProcessor:
             "extend_previous_active",
             when(
                 (col(status_col) == "A") &
-                (lead("is_short_gap").over(person_window) == 1),
+                (lead(col("is_short_gap")).over(person_window) == 1),
                 1
             ).otherwise(0)
         )
@@ -146,7 +147,7 @@ class SurvivalDataProcessor:
             end_date_col,
             when(
                 col("extend_previous_active") == 1,
-                date_sub(lead(lead(start_date_col).over(person_window)).over(person_window), 1)
+                date_sub(lead(lead(col(start_date_col)).over(person_window)).over(person_window), 1)
             ).otherwise(col(end_date_col))
         )
         
@@ -155,10 +156,11 @@ class SurvivalDataProcessor:
         
         logger.info(f"Short gap filling: {df.count():,} -> {result.count():,} records")# TODO commment
         return result
+
     
     def identify_employment_cycles(self, df: DataFrame,
-                                 status_col: str = "work_assgmt_stus_cd",
-                                 start_date_col: str = "rec_eff_strt_dt_mod") -> DataFrame:
+                                status_col: str = "work_asgnmt_stus_cd",
+                                start_date_col: str = "rec_eff_start_dt_mod") -> DataFrame:
         """
         Identify employment cycles and flag latest cycle records
         Handles rehired employees by isolating current employment period
@@ -172,15 +174,15 @@ class SurvivalDataProcessor:
             col(status_col) == "T"
         ).groupBy(self.person_id_combined).agg(
             count("*").alias("total_employment_cycles"),
-            max(start_date_col).alias("latest_termination_date"),
-            expr("sort_array(collect_list(rec_eff_strt_dt_mod), false)").alias("all_termination_dates")
+            max(col(start_date_col)).alias("latest_termination_date"),
+            expr(f"sort_array(collect_list({start_date_col}), false)").alias("all_termination_dates")
         ).withColumn(
             "has_multiple_cycles", 
             when(col("total_employment_cycles") > 1, 1).otherwise(0)
         ).withColumn(
             "second_latest_termination_date",
             when(size(col("all_termination_dates")) >= 2, 
-                 col("all_termination_dates")[1]).otherwise(null())
+                col("all_termination_dates")[1]).otherwise(null())
         )
         
         # Join cycle information back to main dataset
@@ -199,7 +201,7 @@ class SurvivalDataProcessor:
             "record_rank",
             row_number().over(
                 Window.partitionBy(self.person_id_combined)
-                      .orderBy(desc(start_date_col))
+                    .orderBy(desc(col(start_date_col)))
             )
         ).filter(col("record_rank") == 1).select(
             self.person_id_combined,
@@ -227,7 +229,7 @@ class SurvivalDataProcessor:
             "is_latest_cycle",
             when(
                 col(start_date_col) > coalesce(col("latest_cycle_start_date"), 
-                                             lit("1900-01-01").cast("date")),
+                                            lit("1900-01-01").cast("date")),
                 1
             ).otherwise(0)
         ).withColumn(
@@ -262,9 +264,9 @@ class SurvivalDataProcessor:
         return latest_cycle_records
     
     def compress_episodes(self, df: DataFrame, 
-                         compression_cols: list = None,
-                         start_date_col: str = "rec_eff_strt_dt_mod",
-                         end_date_col: str = "rec_eff_end_dt") -> DataFrame:
+                        compression_cols: list = None,
+                        start_date_col: str = "rec_eff_start_dt_mod",
+                        end_date_col: str = "rec_eff_end_dt") -> DataFrame:
         """
         Compress consecutive episodes with identical feature combinations
         Reduces start-stop dataset size while preserving temporal information
@@ -282,13 +284,13 @@ class SurvivalDataProcessor:
         # Create hash of compression columns to detect changes
         compression_hash = sha2(
             concat_ws("|", *[coalesce(col(c).cast("string"), lit("NULL")) 
-                           for c in compression_cols]), 
+                        for c in compression_cols]), 
             256
         )
         
         # Identify episode boundaries where feature combinations change
         df_with_changes = df_with_id.withColumn("compression_hash", compression_hash) \
-            .withColumn("prev_hash", lag("compression_hash").over(person_window)) \
+            .withColumn("prev_hash", lag(col("compression_hash")).over(person_window)) \
             .withColumn(
                 "episode_boundary",
                 when(
@@ -298,7 +300,7 @@ class SurvivalDataProcessor:
                 ).otherwise(0)
             ).withColumn(
                 "episode_id",
-                sum("episode_boundary").over(
+                sum(col("episode_boundary")).over(
                     person_window.rowsBetween(Window.unboundedPreceding, 0)
                 )
             )
@@ -307,26 +309,24 @@ class SurvivalDataProcessor:
         compressed_episodes = df_with_changes.groupBy(
             self.person_id_combined, "episode_id"
         ).agg(
-            min(start_date_col).alias(start_date_col),
-            max(end_date_col).alias(end_date_col),
+            min(col(start_date_col)).alias(start_date_col),
+            max(col(end_date_col)).alias(end_date_col),
             count("*").alias("original_records_compressed"),
             first(struct(*[c for c in df.columns 
-                          if c not in [start_date_col, end_date_col]])).alias("episode_data")
+                        if c not in [start_date_col, end_date_col]])).alias("episode_data")
         ).select(
             col("episode_data.*"),
             col(start_date_col),
             col(end_date_col),
             col("original_records_compressed")
         )
-        
-        # TODO commment
+        # TODO commment        
         compression_ratio = 1 - (compressed_episodes.count() / df_with_id.count())
         logger.info(f"Episode compression: {df_with_id.count():,} -> {compressed_episodes.count():,} "
-                   f"({compression_ratio:.2%} reduction)")
+                f"({compression_ratio:.2%} reduction)")
         # TODO commment
-        
-        return compressed_episodes
-    
+                
+        return compressed_episodes    
     def create_baseline_features(self, df: DataFrame, vantage_date: str) -> DataFrame:
         """
         Create baseline employee features as of vantage date
@@ -337,10 +337,10 @@ class SurvivalDataProcessor:
         vantage_date_lit = lit(vantage_date).cast("date")
         
         # Get most recent record on or before vantage date
-        baseline_window = Window.partitionBy(self.person_id_combined).orderBy(desc("rec_eff_strt_dt_mod"))
+        baseline_window = Window.partitionBy(self.person_id_combined).orderBy(desc("rec_eff_start_dt_mod"))
         
         baseline_records = df_with_id.filter(
-            col("rec_eff_strt_dt_mod") <= vantage_date_lit
+            col("rec_eff_start_dt_mod") <= vantage_date_lit
         ).withColumn(
             "baseline_rank", row_number().over(baseline_window)
         ).filter(col("baseline_rank") == 1)
@@ -348,7 +348,7 @@ class SurvivalDataProcessor:
         # Calculate tenure and experience features
         enhanced_features = baseline_records.withColumn(
             "tenure_at_vantage_days",
-            datediff(vantage_date_lit, col("rec_eff_strt_dt_mod"))
+            datediff(vantage_date_lit, col("rec_eff_start_dt_mod"))
         ).withColumn(
             "baseline_salary", col("annl_cmpn_amt")
         ).withColumn(
@@ -357,7 +357,7 @@ class SurvivalDataProcessor:
         
         # Count job changes up to vantage date
         job_changes = df_with_id.filter(
-            col("rec_eff_strt_dt_mod") <= vantage_date_lit
+            col("rec_eff_start_dt_mod") <= vantage_date_lit
         ).groupBy(self.person_id_combined).agg(
             countDistinct("job_dsc").alias("job_changes_count"),
             countDistinct("mngr_pers_obj_id").alias("manager_changes_count"),
@@ -388,11 +388,11 @@ class SurvivalDataProcessor:
         
         # Identify terminations within follow-up period
         future_terminations = df_with_id.join(active_employees, self.person_id_combined).filter(
-            (col("work_assgmt_stus_cd") == "T") &
-            (col("rec_eff_strt_dt_mod") > vantage_date_lit) &
-            (col("rec_eff_strt_dt_mod") <= follow_up_end_date)
+            (col("work_asgnmt_stus_cd") == "T") &
+            (col("rec_eff_start_dt_mod") > vantage_date_lit) &
+            (col("rec_eff_start_dt_mod") <= follow_up_end_date)
         ).groupBy(self.person_id_combined).agg(
-            min("rec_eff_strt_dt_mod").alias("termination_date")
+            min("rec_eff_start_dt_mod").alias("termination_date")
         ).withColumn(
             "survival_time_days",
             datediff(col("termination_date"), vantage_date_lit)
@@ -471,7 +471,7 @@ class SurvivalDataProcessor:
             
             # Historical episodes up to vantage date only
             historical_episodes = df_with_id.join(split_persons, self.person_id_combined) \
-                .filter(col("rec_eff_strt_dt_mod") <= vantage_date_lit)
+                .filter(col("rec_eff_start_dt_mod") <= vantage_date_lit)
             
             # Apply compression if requested
             if compressed:
@@ -479,14 +479,14 @@ class SurvivalDataProcessor:
             
             # Get hire dates for time reference
             hire_dates = historical_episodes.groupBy(self.person_id_combined).agg(
-                min("rec_eff_strt_dt_mod").alias("hire_date")
+                min("rec_eff_start_dt_mod").alias("hire_date")
             )
             
             # Create start-stop time variables relative to hire date
             start_stop_episodes = historical_episodes.join(hire_dates, self.person_id_combined) \
                 .withColumn(
                     "start_time",
-                    datediff(col("rec_eff_strt_dt_mod"), col("hire_date"))
+                    datediff(col("rec_eff_start_dt_mod"), col("hire_date"))
                 ).withColumn(
                     "stop_time",
                     when(
@@ -500,9 +500,9 @@ class SurvivalDataProcessor:
             # Calculate survival outcomes for target variable
             active_employees = split_persons.join(
                 df_with_id.filter(
-                    (col("rec_eff_strt_dt_mod") <= vantage_date_lit) &
+                    (col("rec_eff_start_dt_mod") <= vantage_date_lit) &
                     (col("rec_eff_end_dt") >= vantage_date_lit) &
-                    (col("work_assgmt_stus_cd") == "A")
+                    (col("work_asgnmt_stus_cd") == "A")
                 ).select(self.person_id_combined).distinct(),
                 self.person_id_combined
             )
@@ -562,9 +562,9 @@ class SurvivalDataProcessor:
             # Get active employees on vantage date
             active_employees = split_persons.join(
                 df_with_id.filter(
-                    (col("rec_eff_strt_dt_mod") <= lit(vantage_date).cast("date")) &
+                    (col("rec_eff_start_dt_mod") <= lit(vantage_date).cast("date")) &
                     (col("rec_eff_end_dt") >= lit(vantage_date).cast("date")) &
-                    (col("work_assgmt_stus_cd") == "A")
+                    (col("work_asgnmt_stus_cd") == "A")
                 ).select(self.person_id_combined).distinct(),
                 self.person_id_combined
             )
@@ -632,15 +632,15 @@ def run_comprehensive_survival_pipeline(spark: SparkSession,
     
     # Get active populations for each vantage date
     active_2023 = df_with_id.filter(
-        (col("rec_eff_strt_dt_mod") <= lit("2023-01-01").cast("date")) &
+        (col("rec_eff_start_dt_mod") <= lit("2023-01-01").cast("date")) &
         (col("rec_eff_end_dt") >= lit("2023-01-01").cast("date")) &
-        (col("work_assgmt_stus_cd") == "A")
+        (col("work_asgnmt_stus_cd") == "A")
     ).select(processor.person_id_combined).distinct()
     
     active_2024 = df_with_id.filter(
-        (col("rec_eff_strt_dt_mod") <= lit("2024-01-01").cast("date")) &
+        (col("rec_eff_start_dt_mod") <= lit("2024-01-01").cast("date")) &
         (col("rec_eff_end_dt") >= lit("2024-01-01").cast("date")) &
-        (col("work_assgmt_stus_cd") == "A")
+        (col("work_asgnmt_stus_cd") == "A")
     ).select(processor.person_id_combined).distinct()
     
     # Phase 3: Create dataset splits
