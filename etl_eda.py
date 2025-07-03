@@ -614,7 +614,7 @@ def run_comprehensive_survival_pipeline(spark: SparkSession,
     # Phase 1: Data cleaning and preprocessing
     logger.info("Phase 1: Cleaning and preprocessing data")
     cleaned_terminations = processor.clean_termination_records(input_df)
-    gap_filled_data = processor.fill_short_gaps(cleaned_terminations, gap_threshold_days)
+    gap_filled_data = processor.fill_short_gaps(cleaned_terminations, gap_threshold_days=gap_threshold_days)
     
     if use_latest_cycle_only:
         modeling_data = processor.get_latest_cycle_records(gap_filled_data)
