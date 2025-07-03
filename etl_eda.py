@@ -182,7 +182,7 @@ class SurvivalDataProcessor:
         ).withColumn(
             "second_latest_termination_date",
             when(size(col("all_termination_dates")) >= 2, 
-                col("all_termination_dates")[1]).otherwise(null())
+                col("all_termination_dates")[1]).otherwise(lit(None))
         )
         
         # Join cycle information back to main dataset
