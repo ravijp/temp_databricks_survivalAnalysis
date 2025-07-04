@@ -695,3 +695,94 @@ if __name__ == "__main__":
     # results = run_comprehensive_survival_pipeline(spark, input_df)
     
     spark.stop()
+# 
+# GET SPECIFIC PERSON IDS
+# 
+from pyspark.sql.functions import col, row_number, asc, desc, rand
+from pyspark.sql.window import Window
+import random
+
+# Get unique person_composite_id across splits
+unique_ids = results['split_assignments'].select('person_composite_id').distinct()
+
+# Join with cleaned data
+joined_df = unique_ids.join(results['cleaned_data'], on='person_composite_id', how='inner')
+
+# Initialize list to track selected IDs and final results
+selected_ids = []
+final_results = []
+
+# 1. Get 1 record of top most annual_campaign_amount
+remaining_df = joined_df
+top_annual = remaining_df.orderBy(desc('annual_campaign_amount')).limit(1)
+top_annual_ids = [row.person_composite_id for row in top_annual.collect()]
+selected_ids.extend(top_annual_ids)
+final_results.append(top_annual)
+
+# 2. Get 1 record of top most monthly_campaign_amount (excluding already selected)
+remaining_df = joined_df.filter(~col('person_composite_id').isin(selected_ids))
+top_monthly = remaining_df.orderBy(desc('monthly_campaign_amount')).limit(1)
+top_monthly_ids = [row.person_composite_id for row in top_monthly.collect()]
+selected_ids.extend(top_monthly_ids)
+final_results.append(top_monthly)
+
+# 3. Get 2 records: 1 with top most episode_duration_days, 1 with least episode_duration_days
+remaining_df = joined_df.filter(~col('person_composite_id').isin(selected_ids))
+
+# Get top episode duration
+top_episode = remaining_df.orderBy(desc('episode_duration_days')).limit(1)
+top_episode_ids = [row.person_composite_id for row in top_episode.collect()]
+selected_ids.extend(top_episode_ids)
+final_results.append(top_episode)
+
+# Get least episode duration (excluding the top one we just selected)
+remaining_df = joined_df.filter(~col('person_composite_id').isin(selected_ids))
+least_episode = remaining_df.orderBy(asc('episode_duration_days')).limit(1)
+least_episode_ids = [row.person_composite_id for row in least_episode.collect()]
+selected_ids.extend(least_episode_ids)
+final_results.append(least_episode)
+
+# 4. Get 2 records each for youngest and oldest based on birth_dt (total 4 records)
+remaining_df = joined_df.filter(~col('person_composite_id').isin(selected_ids))
+
+# Get 2 youngest (highest birth_dt values)
+youngest = remaining_df.orderBy(desc('birth_dt')).limit(2)
+youngest_ids = [row.person_composite_id for row in youngest.collect()]
+selected_ids.extend(youngest_ids)
+final_results.append(youngest)
+
+# Get 2 oldest (lowest birth_dt values) - excluding already selected
+remaining_df = joined_df.filter(~col('person_composite_id').isin(selected_ids))
+oldest = remaining_df.orderBy(asc('birth_dt')).limit(2)
+oldest_ids = [row.person_composite_id for row in oldest.collect()]
+selected_ids.extend(oldest_ids)
+final_results.append(oldest)
+
+# 5. Get 4 random IDs from remaining
+remaining_df = joined_df.filter(~col('person_composite_id').isin(selected_ids))
+random_ids = remaining_df.orderBy(rand()).limit(4)
+random_ids_list = [row.person_composite_id for row in random_ids.collect()]
+selected_ids.extend(random_ids_list)
+final_results.append(random_ids)
+
+# Combine all results
+from functools import reduce
+person_composite_id_df = reduce(lambda df1, df2: df1.union(df2), final_results)
+
+# Verify we have the right number of records
+print(f"Total selected IDs: {person_composite_id_df.count()}")
+print(f"Expected: 12 (1+1+2+2+2+4)")
+
+# Show the final results
+display(person_composite_id_df.select('person_composite_id').distinct().orderBy('person_composite_id'))
+
+# Optional: Show breakdown by category
+print("\nBreakdown:")
+print(f"Top Annual: {len(top_annual_ids)} IDs")
+print(f"Top Monthly: {len(top_monthly_ids)} IDs") 
+print(f"Top Episode Duration: {len(top_episode_ids)} IDs")
+print(f"Least Episode Duration: {len(least_episode_ids)} IDs")
+print(f"Youngest: {len(youngest_ids)} IDs")
+print(f"Oldest: {len(oldest_ids)} IDs")
+print(f"Random: {len(random_ids_list)} IDs")
+print(f"Total unique IDs: {len(set(selected_ids))}")
