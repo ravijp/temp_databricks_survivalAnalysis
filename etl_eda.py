@@ -786,3 +786,73 @@ print(f"Youngest: {len(youngest_ids)} IDs")
 print(f"Oldest: {len(oldest_ids)} IDs")
 print(f"Random: {len(random_ids_list)} IDs")
 print(f"Total unique IDs: {len(set(selected_ids))}")
+
+# ----------------------------------------------------------
+# ----------------------------------------------------------
+# ----------------------------------------------------------
+# ----------------------------------------------------------
+from pyspark.sql.functions import hash, col
+from pyspark.sql.types import IntegerType
+
+def save_optimized(df, table_name, table_prefix):
+    """Expert-level optimized save with intelligent partitioning"""
+    
+    cols = set(df.columns)
+    has_split = 'dataset_split' in cols
+    has_schema = 'db_schema' in cols
+    has_client = 'clnt_obj_id' in cols
+    
+    # Smart partitioning based on data characteristics
+    if has_split and has_schema and has_client:
+        # Hybrid strategy: physical + hash bucketing
+        df_final = df.withColumn("clnt_bucket", (hash(col("clnt_obj_id")) % 100).cast(IntegerType()))
+        
+        (df_final.repartition(3000)
+         .write.format("delta").mode("overwrite")
+         .option("delta.autoOptimize.optimizeWrite", "true")
+         .partitionBy("dataset_split", "db_schema", "clnt_bucket")
+         .saveAsTable(f"{table_prefix}{table_name}"))
+        
+    elif has_split and has_schema:
+        # Simple strategy: dataset + schema only
+        (df.repartition(2000)
+         .write.format("delta").mode("overwrite")
+         .option("delta.autoOptimize.optimizeWrite", "true")
+         .partitionBy("dataset_split", "db_schema")
+         .saveAsTable(f"{table_prefix}{table_name}"))
+        
+    else:
+        # Processing only
+        (df.repartition(1500)
+         .write.format("delta").mode("overwrite")
+         .option("delta.autoOptimize.optimizeWrite", "true")
+         .saveAsTable(f"{table_prefix}{table_name}"))
+
+
+def batch_save(results_dict, table_prefix):
+    """Expert batch processing with error resilience"""
+    
+    # Process in optimal order: small tables first
+    table_order = ['split_assignments', 'employee_level', 'start_stop_compressed', 'cleaned_data', 'start_stop_uncompressed']
+    
+    for table_name in table_order:
+        if table_name in results_dict:
+            try:
+                save_optimized(results_dict[table_name], table_name, table_prefix)
+                print(f"✅ {table_name}")
+            except Exception as e:
+                print(f"❌ {table_name}: {e}")
+                continue
+    
+    # Process any remaining tables
+    for table_name in results_dict:
+        if table_name not in table_order:
+            try:
+                save_optimized(results_dict[table_name], table_name, table_prefix)
+                print(f"✅ {table_name}")
+            except Exception as e:
+                print(f"❌ {table_name}: {e}")
+
+
+# Usage:
+# batch_save(results, table_prefix)
