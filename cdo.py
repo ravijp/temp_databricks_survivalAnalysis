@@ -21,8 +21,8 @@ sns.set_palette("Set2")
 plt.rcParams['figure.figsize'] = (12, 8)
 plt.rcParams['font.size'] = 11
 
-class CDOSurvivalAnalysis:
-    """Complete survival analysis for CDO presentation"""
+class SurvivalAnalysis:
+    """Complete KM XGBoost AFT first cut survival analysis"""
     
     def __init__(self, data: pd.DataFrame):
         self.data = self._prepare_data(data)
@@ -58,15 +58,19 @@ class CDOSurvivalAnalysis:
         return df
     
     def analyze_baseline(self) -> Dict:
-        """Generate population baseline with key business metrics"""
+        """Generate population baseline with key business metrics using train split"""
         print("Analyzing baseline retention patterns...")
         
-        self.kmf.fit(self.data['survival_time_days'], self.data['event_indicator'])
+        # Use train split for primary insights
+        train_data = self.data[self.data['dataset_split'] == 'train']
+        
+        self.kmf.fit(train_data['survival_time_days'], train_data['event_indicator'])
         
         # Key business metrics
         metrics = {
-            'population_size': len(self.data),
-            'event_rate': self.data['event_indicator'].mean(),
+            'population_size': len(train_data),
+            'total_population': len(self.data),
+            'event_rate': train_data['event_indicator'].mean(),
             'median_survival': self.kmf.median_survival_time_,
             'retention_30d': self.kmf.survival_function_at_times(30).iloc[0],
             'retention_90d': self.kmf.survival_function_at_times(90).iloc[0],
@@ -97,7 +101,8 @@ class CDOSurvivalAnalysis:
         plt.show()
         
         print(f"BASELINE INSIGHTS:")
-        print(f"  Population: {metrics['population_size']:,} employees")
+        print(f"  Train population: {metrics['population_size']:,} employees")
+        print(f"  Total population: {metrics['total_population']:,} employees")
         print(f"  Event rate: {metrics['event_rate']:.1%}")
         print(f"  Median survival: {metrics['median_survival']:.0f} days ({metrics['median_survival']/30.44:.1f} months)")
         print(f"  90-day retention: {metrics['retention_90d']:.1%}")
@@ -107,20 +112,23 @@ class CDOSurvivalAnalysis:
         return metrics
     
     def analyze_industries(self, top_n: int = 10) -> Dict:
-        """Analyze retention by industry (NAICS 2-digit)"""
+        """Analyze retention by industry (NAICS 2-digit) using train split"""
         print("Analyzing industry retention patterns...")
         
+        # Use train split for industry insights
+        train_data = self.data[self.data['dataset_split'] == 'train']
+        
         # Get top industries by volume
-        industry_counts = self.data['naics_2digit'].value_counts()
+        industry_counts = train_data['naics_2digit'].value_counts()
         top_industries = industry_counts.head(top_n).index.tolist()
         
         # Filter for meaningful sample sizes
         valid_industries = []
         for industry in top_industries:
-            if industry_counts[industry] >= 5000:  # Minimum sample size
+            if industry_counts[industry] >= 1000:  # Minimum sample size for train split
                 valid_industries.append(industry)
         
-        industry_data = self.data[self.data['naics_2digit'].isin(valid_industries)]
+        industry_data = train_data[train_data['naics_2digit'].isin(valid_industries)]
         industry_metrics = {}
         
         fig, ax = plt.subplots(figsize=(14, 10))
@@ -172,8 +180,11 @@ class CDOSurvivalAnalysis:
         return industry_metrics
     
     def analyze_demographics(self) -> Dict:
-        """Analyze retention by key demographic segments"""
+        """Analyze retention by key demographic segments using train split"""
         print("Analyzing demographic retention patterns...")
+        
+        # Use train split for demographic insights
+        train_data = self.data[self.data['dataset_split'] == 'train']
         
         demographics = {
             'age_group': 'Age Segments',
@@ -184,7 +195,7 @@ class CDOSurvivalAnalysis:
         demo_insights = {}
         
         for demo_col, title in demographics.items():
-            demo_data = self.data[self.data[demo_col].notna()]
+            demo_data = train_data[train_data[demo_col].notna()]
             
             fig, ax = plt.subplots(figsize=(12, 8))
             category_metrics = {}
@@ -195,7 +206,7 @@ class CDOSurvivalAnalysis:
             for category in categories:
                 subset = demo_data[demo_data[demo_col] == category]
                 
-                if len(subset) < 1000:  # Skip small segments
+                if len(subset) < 500:  # Adjusted for train split
                     continue
                 
                 kmf = KaplanMeierFitter()
@@ -240,18 +251,14 @@ class CDOSurvivalAnalysis:
         return demo_insights
     
     def analyze_temporal_trends(self) -> Dict:
-        """Compare retention trends across time periods"""
+        """Compare retention trends: 2023 (train+val) vs 2024 (oot)"""
         print("Analyzing temporal retention trends...")
         
-        if 'dataset_split' not in self.data.columns:
-            print("Dataset split not available")
-            return {}
-        
-        # Compare 2023 vs 2024 cohorts
+        # Use dataset_split to define temporal cohorts
         cohort_2023 = self.data[self.data['dataset_split'].isin(['train', 'val'])]
         cohort_2024 = self.data[self.data['dataset_split'] == 'oot']
         
-        if len(cohort_2024) < 5000:
+        if len(cohort_2024) < 1000:
             print("Insufficient 2024 data for temporal analysis")
             return {}
         
@@ -270,7 +277,7 @@ class CDOSurvivalAnalysis:
         kmf_2024.plot_survival_function(ax=ax, ci_show=False, linewidth=3, color='red',
                                        label=f'2024 Cohort (n={len(cohort_2024):,})')
         
-        ax.set_title('Retention Trends: 2023 vs 2024 Cohorts', fontsize=16, fontweight='bold')
+        ax.set_title('Temporal Retention Trends: 2023 vs 2024', fontsize=16, fontweight='bold')
         ax.set_xlabel('Days Since Assignment Start', fontsize=12)
         ax.set_ylabel('Survival Probability', fontsize=12)
         ax.legend()
@@ -281,59 +288,83 @@ class CDOSurvivalAnalysis:
         
         # Calculate metrics
         trend_metrics = {
+            '2023_size': len(cohort_2023),
+            '2024_size': len(cohort_2024),
+            '2023_retention_90d': kmf_2023.survival_function_at_times(90).iloc[0],
+            '2024_retention_90d': kmf_2024.survival_function_at_times(90).iloc[0],
             '2023_retention_365d': kmf_2023.survival_function_at_times(365).iloc[0],
             '2024_retention_365d': kmf_2024.survival_function_at_times(365).iloc[0],
             '2023_median_survival': kmf_2023.median_survival_time_,
             '2024_median_survival': kmf_2024.median_survival_time_
         }
         
-        retention_change = trend_metrics['2024_retention_365d'] - trend_metrics['2023_retention_365d']
-        trend_direction = "improving" if retention_change > 0 else "declining"
+        # Calculate changes
+        retention_change_90d = trend_metrics['2024_retention_90d'] - trend_metrics['2023_retention_90d']
+        retention_change_365d = trend_metrics['2024_retention_365d'] - trend_metrics['2023_retention_365d']
         
         print(f"TEMPORAL TRENDS:")
-        print(f"  2023 retention: {trend_metrics['2023_retention_365d']:.1%}")
-        print(f"  2024 retention: {trend_metrics['2024_retention_365d']:.1%}")
-        print(f"  Change: {retention_change:+.1%} ({trend_direction})")
+        print(f"  2023 cohort: {trend_metrics['2023_size']:,} employees")
+        print(f"  2024 cohort: {trend_metrics['2024_size']:,} employees")
+        print(f"  90-day retention change: {retention_change_90d:+.1%}")
+        print(f"  1-year retention change: {retention_change_365d:+.1%}")
+        
+        trend_metrics['retention_change_90d'] = retention_change_90d
+        trend_metrics['retention_change_365d'] = retention_change_365d
         
         self.insights['temporal'] = trend_metrics
         return trend_metrics
     
     def build_predictive_model(self) -> Dict:
-        """Build XGBoost AFT model for predictive validation"""
+        """Build XGBoost AFT model using train/val splits"""
         print("Building XGBoost AFT predictive model...")
         
+        # Use proper train/val splits
+        train_data = self.data[self.data['dataset_split'] == 'train']
+        val_data = self.data[self.data['dataset_split'] == 'val']
+        
+        if len(val_data) < 1000:
+            print("Insufficient validation data - using random split from train")
+            # Fallback to random split from train data
+            np.random.seed(42)
+            train_idx = np.random.choice(len(train_data), size=int(0.8 * len(train_data)), replace=False)
+            val_idx = np.setdiff1d(np.arange(len(train_data)), train_idx)
+            
+            val_data = train_data.iloc[val_idx]
+            train_data = train_data.iloc[train_idx]
+        
         # Prepare features
-        feature_columns = ['age', 'tenure_at_vantage_days', 'baseline_salary']
+        feature_columns = ['age', 'gender_cd', 'tenure_at_vantage_days', 'team_size', 
+                           'pay_rt_type_cd', 'fill_tm_part_tm_cd', 'fscl_actv_ind',
+                           'baseline_salary', 'team_avg_comp', 'salary_growth_ratio',
+                           'manager_changes_count']
         
         # Add encoded categorical features
-        if 'naics_2digit' in self.data.columns:
+        if 'naics_2digit' in train_data.columns:
             le_naics = LabelEncoder()
-            self.data['naics_encoded'] = le_naics.fit_transform(self.data['naics_2digit'].astype(str))
+            # Fit on train, transform both train and val
+            train_data = train_data.copy()
+            val_data = val_data.copy()
+            
+            train_data['naics_encoded'] = le_naics.fit_transform(train_data['naics_2digit'].astype(str))
+            val_data['naics_encoded'] = le_naics.transform(val_data['naics_2digit'].astype(str))
             feature_columns.append('naics_encoded')
         
-        # Prepare model dataset
-        model_data = self.data[feature_columns + ['survival_time_days', 'event_indicator']].dropna()
+        # Prepare model datasets
+        train_model_data = train_data[feature_columns + ['survival_time_days', 'event_indicator']].dropna()
+        val_model_data = val_data[feature_columns + ['survival_time_days', 'event_indicator']].dropna()
         
-        # Train-test split
-        np.random.seed(42)
-        train_idx = np.random.choice(len(model_data), size=int(0.8 * len(model_data)), replace=False)
-        test_idx = np.setdiff1d(np.arange(len(model_data)), train_idx)
+        # Extract features and targets
+        X_train = train_model_data[feature_columns]
+        y_train = train_model_data['survival_time_days']
+        event_train = train_model_data['event_indicator']
         
-        train_data = model_data.iloc[train_idx]
-        test_data = model_data.iloc[test_idx]
-        
-        # Prepare XGBoost data
-        X_train = train_data[feature_columns]
-        y_train = train_data['survival_time_days']
-        event_train = train_data['event_indicator']
-        
-        X_test = test_data[feature_columns]
-        y_test = test_data['survival_time_days']
-        event_test = test_data['event_indicator']
+        X_val = val_model_data[feature_columns]
+        y_val = val_model_data['survival_time_days']
+        event_val = val_model_data['event_indicator']
         
         # Train XGBoost AFT model
         dtrain = xgb.DMatrix(X_train, label=y_train)
-        dtest = xgb.DMatrix(X_test, label=y_test)
+        dval = xgb.DMatrix(X_val, label=y_val)
         
         # Set survival information
         dtrain.set_float_info('label_lower_bound', y_train.values)
@@ -355,11 +386,11 @@ class CDOSurvivalAnalysis:
         
         # Generate predictions
         train_pred = model.predict(dtrain)
-        test_pred = model.predict(dtest)
+        val_pred = model.predict(dval)
         
         # Calculate performance
         c_index_train = concordance_index(y_train, train_pred, event_train)
-        c_index_test = concordance_index(y_test, test_pred, event_test)
+        c_index_val = concordance_index(y_val, val_pred, event_val)
         
         # Feature importance
         feature_importance = model.get_score(importance_type='gain')
@@ -368,8 +399,8 @@ class CDOSurvivalAnalysis:
             for f, score in feature_importance.items()
         ]).sort_values('importance', ascending=False)
         
-        # Risk segmentation
-        risk_percentiles = np.percentile(test_pred, [20, 50, 80])
+        # Risk segmentation based on validation predictions
+        risk_percentiles = np.percentile(val_pred, [20, 50, 80])
         
         # Visualize feature importance
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -381,18 +412,20 @@ class CDOSurvivalAnalysis:
         plt.show()
         
         model_results = {
-            'train_size': len(train_data),
-            'test_size': len(test_data),
+            'train_size': len(train_model_data),
+            'val_size': len(val_model_data),
             'c_index_train': c_index_train,
-            'c_index_test': c_index_test,
+            'c_index_val': c_index_val,
             'feature_importance': importance_df,
             'risk_percentiles': risk_percentiles
         }
         
         print(f"MODEL PERFORMANCE:")
+        print(f"  Training size: {len(train_model_data):,}")
+        print(f"  Validation size: {len(val_model_data):,}")
         print(f"  Training C-index: {c_index_train:.3f}")
-        print(f"  Test C-index: {c_index_test:.3f}")
-        print(f"  Performance: {'Strong' if c_index_test > 0.65 else 'Moderate' if c_index_test > 0.55 else 'Baseline'}")
+        print(f"  Validation C-index: {c_index_val:.3f}")
+        print(f"  Performance: {'Strong' if c_index_val > 0.65 else 'Moderate' if c_index_val > 0.55 else 'Baseline'}")
         
         print(f"\nTOP FEATURES:")
         for _, row in importance_df.head(3).iterrows():
@@ -414,7 +447,8 @@ class CDOSurvivalAnalysis:
         baseline = self.insights['baseline']
         
         summary = {
-            'population_size': f"{baseline['population_size']:,}",
+            'train_population_size': f"{baseline['population_size']:,}",
+            'total_population_size': f"{baseline['total_population']:,}",
             'median_survival_days': f"{baseline['median_survival']:.0f}",
             'median_survival_months': f"{baseline['median_survival']/30.44:.1f}",
             'retention_90d': f"{baseline['retention_90d']:.1%}",
@@ -427,22 +461,25 @@ class CDOSurvivalAnalysis:
         
         if 'industry' in self.insights:
             ranked = self.insights['industry']['ranked']
-            gap = ranked[0][1]['retention_365d'] - ranked[-1][1]['retention_365d']
-            opportunities.append(f"Industry performance gap: {gap:.1%} improvement opportunity")
+            if ranked:
+                gap = ranked[0][1]['retention_365d'] - ranked[-1][1]['retention_365d']
+                opportunities.append(f"Industry performance gap: {gap:.1%} improvement opportunity")
         
         if 'temporal' in self.insights:
             temporal = self.insights['temporal']
-            change = temporal['2024_retention_365d'] - temporal['2023_retention_365d']
-            direction = "improving" if change > 0 else "declining"
-            opportunities.append(f"Retention {direction} {abs(change):.1%} year-over-year")
+            if 'retention_change_365d' in temporal:
+                change = temporal['retention_change_365d']
+                direction = "improving" if change > 0 else "declining"
+                opportunities.append(f"Retention {direction} {abs(change):.1%} year-over-year")
         
         if 'model' in self.insights:
             model = self.insights['model']
-            opportunities.append(f"Predictive model achieves {model['c_index_test']:.3f} C-index")
+            opportunities.append(f"Predictive model achieves {model['c_index_val']:.3f} C-index")
         
         summary['key_opportunities'] = opportunities
         
-        print(f"Population analyzed: {summary['population_size']} employees")
+        print(f"Analysis based on train population: {summary['train_population_size']} employees")
+        print(f"Total population available: {summary['total_population_size']} employees")
         print(f"Median assignment duration: {summary['median_survival_days']} days ({summary['median_survival_months']} months)")
         print(f"90-day retention: {summary['retention_90d']}")
         print(f"1-year retention: {summary['retention_365d']}")
@@ -456,7 +493,7 @@ class CDOSurvivalAnalysis:
     
     def run_complete_analysis(self) -> Dict:
         """Execute complete survival analysis sequence"""
-        print("STARTING COMPLETE CDO SURVIVAL ANALYSIS")
+        print("STARTING COMPLETE  SURVIVAL ANALYSIS")
         print("=" * 60)
         
         # Execute full analysis
@@ -472,9 +509,9 @@ class CDOSurvivalAnalysis:
         return {'insights': self.insights, 'summary': summary}
 
 
-def run_cdo_survival_analysis(employee_data: pd.DataFrame) -> Tuple[CDOSurvivalAnalysis, Dict]:
+def run_cdo_survival_analysis(employee_data: pd.DataFrame) -> Tuple[SurvivalAnalysis, Dict]:
     """
-    Execute complete CDO survival analysis combining Kaplan-Meier and XGBoost AFT
+    Execute complete  survival analysis combining Kaplan-Meier and XGBoost AFT
     
     Args:
         employee_data: Employee-level dataset with survival outcomes
@@ -482,19 +519,8 @@ def run_cdo_survival_analysis(employee_data: pd.DataFrame) -> Tuple[CDOSurvivalA
     Returns:
         Tuple of (analyzer, executive_summary)
     """
-    analyzer = CDOSurvivalAnalysis(employee_data)
+    analyzer = SurvivalAnalysis(employee_data)
     results = analyzer.run_complete_analysis()
     
     return analyzer, results['summary']
 
-
-# Example usage for CDO meeting
-if __name__ == "__main__":
-    # Single command execution
-    # analyzer, summary = run_cdo_survival_analysis(employee_level_data)
-    
-    # CDO presentation metrics
-    # print(f"Population: {summary['population_size']}")
-    # print(f"Median duration: {summary['median_survival_months']} months")
-    # print(f"Retention rate: {summary['retention_365d']}")
-    pass
