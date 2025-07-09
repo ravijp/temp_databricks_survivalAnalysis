@@ -33,27 +33,38 @@ class SurvivalAnalysis:
         """Prepare analysis dataset with flexible business segments"""
         df = df.copy()
         
+        # Calculate age from birth_dt and vantage_date
+        if 'birth_dt' in df.columns and 'vantage_date' in df.columns:
+            df['birth_dt'] = pd.to_datetime(df['birth_dt'])
+            df['vantage_date'] = pd.to_datetime(df['vantage_date'])
+            df['age'] = (df['vantage_date'] - df['birth_dt']).dt.days / 365.25
+            # df['age'] = df['age'].clip(lower=16, upper=100)  # Reasonable bounds > to do later
+        
         # NAICS 2-digit grouping
-        df['naics_2digit'] = df['naics_cd'].astype(str).str[:2]
+        if 'naics_cd' in df.columns:
+            df['naics_2digit'] = df['naics_cd'].astype(str).str[:2]
         
         # Flexible age grouping (handles age > 100)
-        df['age_group'] = pd.cut(df['age'], 
-                                bins=[0, 25, 35, 45, 55, 65, np.inf], 
-                                labels=['<25', '25-35', '35-45', '45-55', '55-65', '65+'],
-                                include_lowest=True)
+        if 'age' in df.columns:
+            df['age_group'] = pd.cut(df['age'], 
+                                    bins=[0, 25, 35, 45, 55, 65, np.inf], 
+                                    labels=['<25', '25-35', '35-45', '45-55', '55-65', '65+'],
+                                    include_lowest=True)
         
-        # Flexible tenure grouping (handles very long tenure)
-        tenure_years = df['tenure_at_vantage_days'] / 365.25
-        df['tenure_group'] = pd.cut(tenure_years,
-                                   bins=[0, 0.5, 1, 2, 3, 5, np.inf],
-                                   labels=['<6mo', '6mo-1yr', '1-2yr', '2-3yr', '3-5yr', '5yr+'],
-                                   include_lowest=True)
+        # Flexible tenure grouping
+        if 'tenure_at_vantage_days' in df.columns:
+            tenure_years = df['tenure_at_vantage_days'] / 365.25
+            df['tenure_group'] = pd.cut(tenure_years,
+                                    bins=[0, 0.5, 1, 2, 3, 5, np.inf],
+                                    labels=['<6mo', '6mo-1yr', '1-2yr', '2-3yr', '3-5yr', '5yr+'],
+                                    include_lowest=True)
         
-        # Flexible salary grouping (handles very high salaries)
-        df['salary_group'] = pd.cut(df['baseline_salary'], 
-                                   bins=[0, 40000, 60000, 80000, 120000, 200000, np.inf],
-                                   labels=['<40K', '40-60K', '60-80K', '80-120K', '120-200K', '200K+'],
-                                   include_lowest=True)
+        # Flexible salary grouping
+        if 'baseline_salary' in df.columns:
+            df['salary_group'] = pd.cut(df['baseline_salary'], 
+                                    bins=[0, 40000, 60000, 80000, 120000, 200000, np.inf],
+                                    labels=['<40K', '40-60K', '60-80K', '80-120K', '120-200K', '200K+'],
+                                    include_lowest=True)
         
         return df
     
