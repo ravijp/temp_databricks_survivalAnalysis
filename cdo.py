@@ -360,42 +360,45 @@ class SurvivalAnalysis:
         train_data = train_data.copy()
         val_data = val_data.copy()
         
-        # Handle categorical features with LabelEncoder
+        # Handle categorical features with production-grade encoding
         label_encoders = {}
+
         for cat_feature in available_categorical:
-            le = LabelEncoder()
+            # Prepare data
+            train_cats = train_data[cat_feature].fillna('MISSING').astype(str)
+            val_cats = val_data[cat_feature].fillna('MISSING').astype(str)
             
-            # Handle missing values by replacing with 'MISSING'
-            train_data[cat_feature] = train_data[cat_feature].fillna('MISSING')
-            val_data[cat_feature] = val_data[cat_feature].fillna('MISSING')
+            # Get unique categories in both train and validation sets
+            all_categories = set(train_cats.unique()) | set(val_cats.unique())
             
-            # Fit on train, transform both train and val
-            train_data[f'{cat_feature}_encoded'] = le.fit_transform(train_data[cat_feature].astype(str))
+            # Create a mapping dictionary instead of using LabelEncoder
+            category_mapping = {cat: idx for idx, cat in enumerate(all_categories)}
             
-            # Handle unseen categories in validation
-            def safe_transform(values):
-                result = []
-                for val in values:
-                    if val in le.classes_:
-                        result.append(le.transform([val])[0])
-                    else:
-                        # Assign to first class for unseen values
-                        result.append(0)
-                return result
+            # Transform data using the mapping
+            train_data[f'{cat_feature}_encoded'] = train_cats.map(category_mapping)
+            val_data[f'{cat_feature}_encoded'] = val_cats.map(category_mapping)
             
-            val_data[f'{cat_feature}_encoded'] = safe_transform(val_data[cat_feature].astype(str))
-            label_encoders[cat_feature] = le
-        
-        # NAICS encoding (if available)
+            # Store the mapping for future reference
+            label_encoders[cat_feature] = category_mapping
+
+        # Handle NAICS with custom encoding instead of LabelEncoder
         if 'naics_2digit' in train_data.columns:
-            le_naics = LabelEncoder()
-            train_data['naics_2digit'] = train_data['naics_2digit'].fillna('MISSING')
-            val_data['naics_2digit'] = val_data['naics_2digit'].fillna('MISSING')
+            # Prepare data
+            train_naics = train_data['naics_2digit'].fillna('MISSING').astype(str)
+            val_naics = val_data['naics_2digit'].fillna('MISSING').astype(str)
             
-            train_data['naics_encoded'] = le_naics.fit_transform(train_data['naics_2digit'].astype(str))
-            val_data['naics_encoded'] = safe_transform(val_data['naics_2digit'].astype(str))
+            # Get all unique NAICS codes from both train and validation
+            all_naics = set(train_naics.unique()) | set(val_naics.unique())
+            
+            # Create a mapping dictionary - simpler than using LabelEncoder
+            naics_mapping = {naics: idx for idx, naics in enumerate(all_naics)}
+            
+            # Apply mapping to create encoded features
+            train_data['naics_encoded'] = train_naics.map(naics_mapping)
+            val_data['naics_encoded'] = val_naics.map(naics_mapping)
+            
             available_numeric.append('naics_encoded')
-            label_encoders['naics_2digit'] = le_naics
+            label_encoders['naics_2digit'] = naics_mapping
         
         # Create final feature list
         encoded_categorical = [f'{cat}_encoded' for cat in available_categorical]
@@ -403,6 +406,22 @@ class SurvivalAnalysis:
         
         # Prepare model datasets - only numeric columns
         model_columns = feature_columns + ['survival_time_days', 'event_indicator']
+        
+        # Handle potential missing values by filling with median/mode
+        for col in feature_columns:
+            if col in train_data.columns and train_data[col].isna().any():
+                if train_data[col].dtype in [np.float64, np.int64]:
+                    # Fill numeric columns with median
+                    fill_value = train_data[col].median()
+                    train_data[col] = train_data[col].fillna(fill_value)
+                    val_data[col] = val_data[col].fillna(fill_value)
+                else:
+                    # Fill categorical columns with mode
+                    fill_value = train_data[col].mode().iloc[0]
+                    train_data[col] = train_data[col].fillna(fill_value)
+                    val_data[col] = val_data[col].fillna(fill_value)
+        
+        # Make sure all required columns exist and drop rows with NAs
         train_model_data = train_data[model_columns].dropna()
         val_model_data = val_data[model_columns].dropna()
         
@@ -422,6 +441,12 @@ class SurvivalAnalysis:
             print(f"  {col}: {dtype}")
             if dtype == 'object':
                 print(f"  WARNING: {col} is still object type!")
+                # Convert object to numeric as a failsafe
+                X_train[col] = pd.to_numeric(X_train[col], errors='coerce')
+                X_val[col] = pd.to_numeric(X_val[col], errors='coerce')
+                # Fill NAs that might have been introduced
+                X_train[col] = X_train[col].fillna(X_train[col].median())
+                X_val[col] = X_val[col].fillna(X_train[col].median())
         
         # Train XGBoost AFT model
         dtrain = xgb.DMatrix(X_train, label=y_train)
@@ -455,22 +480,33 @@ class SurvivalAnalysis:
         
         # Feature importance
         feature_importance = model.get_score(importance_type='gain')
-        importance_df = pd.DataFrame([
-            {'feature': feature_columns[int(f[1:])], 'importance': score}
-            for f, score in feature_importance.items()
-        ]).sort_values('importance', ascending=False)
+        
+        # Handle potential feature indexing issues in XGBoost feature importance
+        importance_df = pd.DataFrame()
+        try:
+            importance_df = pd.DataFrame([
+                {'feature': feature_columns[int(f[1:])], 'importance': score}
+                for f, score in feature_importance.items()
+            ]).sort_values('importance', ascending=False)
+        except (IndexError, ValueError):
+            # Fallback if the feature indices don't match
+            importance_df = pd.DataFrame([
+                {'feature': f, 'importance': score}
+                for f, score in feature_importance.items()
+            ]).sort_values('importance', ascending=False)
         
         # Risk segmentation
         risk_percentiles = np.percentile(val_pred, [20, 50, 80])
         
         # Visualization
         fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(data=importance_df, x='importance', y='feature', ax=ax)
-        ax.set_title('Feature Importance - XGBoost AFT Model', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Importance Score')
-        plt.tight_layout()
-        plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
-        plt.show()
+        if not importance_df.empty:
+            sns.barplot(data=importance_df, x='importance', y='feature', ax=ax)
+            ax.set_title('Feature Importance - XGBoost AFT Model', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Importance Score')
+            plt.tight_layout()
+            plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
+            plt.show()
         
         model_results = {
             'train_size': len(train_model_data),
@@ -496,7 +532,7 @@ class SurvivalAnalysis:
         
         self.insights['model'] = model_results
         return model_results
-
+    
     def generate_executive_summary(self) -> Dict:
         """Generate comprehensive executive summary"""
         print("\nEXECUTIVE SUMMARY")
