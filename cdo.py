@@ -315,7 +315,7 @@ class SurvivalAnalysis:
         return trend_metrics
     
     def build_predictive_model(self) -> Dict:
-        """Build XGBoost AFT model using train/val splits"""
+        """Build XGBoost AFT model with proper categorical handling"""
         print("Building XGBoost AFT predictive model...")
         
         # Use proper train/val splits
@@ -324,34 +324,76 @@ class SurvivalAnalysis:
         
         if len(val_data) < 1000:
             print("Insufficient validation data - using random split from train")
-            # Fallback to random split from train data
             np.random.seed(42)
             train_idx = np.random.choice(len(train_data), size=int(0.8 * len(train_data)), replace=False)
             val_idx = np.setdiff1d(np.arange(len(train_data)), train_idx)
-            
             val_data = train_data.iloc[val_idx]
             train_data = train_data.iloc[train_idx]
         
-        # Prepare features
-        feature_columns = ['age', 'gender_cd', 'tenure_at_vantage_days', 'team_size', 
-                           'pay_rt_type_cd', 'fill_tm_part_tm_cd', 'fscl_actv_ind',
-                           'baseline_salary', 'team_avg_comp', 'salary_growth_ratio',
-                           'manager_changes_count']
+        # Define numeric features (based on your data types)
+        numeric_features = [
+            'age', 'tenure_at_vantage_days', 'team_size', 'baseline_salary',
+            'team_avg_comp', 'salary_growth_ratio', 'manager_changes_count'
+        ]
         
-        # Add encoded categorical features
+        # Define categorical features
+        categorical_features = [
+            'gender_cd', 'pay_rt_type_cd', 'full_tm_part_tm_cd', 'fscl_actv_ind'
+        ]
+        
+        # Filter features that actually exist in data
+        available_numeric = [f for f in numeric_features if f in train_data.columns]
+        available_categorical = [f for f in categorical_features if f in train_data.columns]
+        
+        # Copy data to avoid modifying original
+        train_data = train_data.copy()
+        val_data = val_data.copy()
+        
+        # Handle categorical features with LabelEncoder
+        label_encoders = {}
+        for cat_feature in available_categorical:
+            le = LabelEncoder()
+            
+            # Handle missing values by replacing with 'MISSING'
+            train_data[cat_feature] = train_data[cat_feature].fillna('MISSING')
+            val_data[cat_feature] = val_data[cat_feature].fillna('MISSING')
+            
+            # Fit on train, transform both train and val
+            train_data[f'{cat_feature}_encoded'] = le.fit_transform(train_data[cat_feature].astype(str))
+            
+            # Handle unseen categories in validation
+            def safe_transform(values):
+                result = []
+                for val in values:
+                    if val in le.classes_:
+                        result.append(le.transform([val])[0])
+                    else:
+                        # Assign to first class for unseen values
+                        result.append(0)
+                return result
+            
+            val_data[f'{cat_feature}_encoded'] = safe_transform(val_data[cat_feature].astype(str))
+            label_encoders[cat_feature] = le
+        
+        # NAICS encoding (if available)
         if 'naics_2digit' in train_data.columns:
             le_naics = LabelEncoder()
-            # Fit on train, transform both train and val
-            train_data = train_data.copy()
-            val_data = val_data.copy()
+            train_data['naics_2digit'] = train_data['naics_2digit'].fillna('MISSING')
+            val_data['naics_2digit'] = val_data['naics_2digit'].fillna('MISSING')
             
             train_data['naics_encoded'] = le_naics.fit_transform(train_data['naics_2digit'].astype(str))
-            val_data['naics_encoded'] = le_naics.transform(val_data['naics_2digit'].astype(str))
-            feature_columns.append('naics_encoded')
+            val_data['naics_encoded'] = safe_transform(val_data['naics_2digit'].astype(str))
+            available_numeric.append('naics_encoded')
+            label_encoders['naics_2digit'] = le_naics
         
-        # Prepare model datasets
-        train_model_data = train_data[feature_columns + ['survival_time_days', 'event_indicator']].dropna()
-        val_model_data = val_data[feature_columns + ['survival_time_days', 'event_indicator']].dropna()
+        # Create final feature list
+        encoded_categorical = [f'{cat}_encoded' for cat in available_categorical]
+        feature_columns = available_numeric + encoded_categorical
+        
+        # Prepare model datasets - only numeric columns
+        model_columns = feature_columns + ['survival_time_days', 'event_indicator']
+        train_model_data = train_data[model_columns].dropna()
+        val_model_data = val_data[model_columns].dropna()
         
         # Extract features and targets
         X_train = train_model_data[feature_columns]
@@ -361,6 +403,14 @@ class SurvivalAnalysis:
         X_val = val_model_data[feature_columns]
         y_val = val_model_data['survival_time_days']
         event_val = val_model_data['event_indicator']
+        
+        # Verify all features are numeric
+        print(f"Feature dtypes check:")
+        for col in feature_columns:
+            dtype = X_train[col].dtype
+            print(f"  {col}: {dtype}")
+            if dtype == 'object':
+                print(f"  WARNING: {col} is still object type!")
         
         # Train XGBoost AFT model
         dtrain = xgb.DMatrix(X_train, label=y_train)
@@ -399,10 +449,10 @@ class SurvivalAnalysis:
             for f, score in feature_importance.items()
         ]).sort_values('importance', ascending=False)
         
-        # Risk segmentation based on validation predictions
+        # Risk segmentation
         risk_percentiles = np.percentile(val_pred, [20, 50, 80])
         
-        # Visualize feature importance
+        # Visualization
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.barplot(data=importance_df, x='importance', y='feature', ax=ax)
         ax.set_title('Feature Importance - XGBoost AFT Model', fontsize=14, fontweight='bold')
@@ -417,7 +467,9 @@ class SurvivalAnalysis:
             'c_index_train': c_index_train,
             'c_index_val': c_index_val,
             'feature_importance': importance_df,
-            'risk_percentiles': risk_percentiles
+            'risk_percentiles': risk_percentiles,
+            'features_used': feature_columns,
+            'label_encoders': label_encoders
         }
         
         print(f"MODEL PERFORMANCE:")
@@ -425,20 +477,15 @@ class SurvivalAnalysis:
         print(f"  Validation size: {len(val_model_data):,}")
         print(f"  Training C-index: {c_index_train:.3f}")
         print(f"  Validation C-index: {c_index_val:.3f}")
-        print(f"  Performance: {'Strong' if c_index_val > 0.65 else 'Moderate' if c_index_val > 0.55 else 'Baseline'}")
+        print(f"  Features used: {len(feature_columns)}")
         
         print(f"\nTOP FEATURES:")
         for _, row in importance_df.head(3).iterrows():
             print(f"  {row['feature']}: {row['importance']:.1f}")
         
-        print(f"\nRISK SEGMENTATION:")
-        print(f"  High risk (20%): < {risk_percentiles[0]:.0f} days predicted survival")
-        print(f"  Medium risk (60%): {risk_percentiles[0]:.0f} - {risk_percentiles[2]:.0f} days")
-        print(f"  Low risk (20%): > {risk_percentiles[2]:.0f} days predicted survival")
-        
         self.insights['model'] = model_results
         return model_results
-    
+
     def generate_executive_summary(self) -> Dict:
         """Generate comprehensive executive summary"""
         print("\nEXECUTIVE SUMMARY")
