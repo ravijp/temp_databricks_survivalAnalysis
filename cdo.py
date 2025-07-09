@@ -428,8 +428,8 @@ class SurvivalAnalysis:
         dval = xgb.DMatrix(X_val, label=y_val)
         
         # Set survival information
-        dtrain.set_float_info('label_lower_bound', y_train.values)
-        dtrain.set_uint_info('label_right_censored', (1 - event_train).values.astype(np.uint32))
+        dtrain.set_info(label_lower_bound=y_train.values)
+        dtrain.set_info(label_right_censored=(1 - event_train).values.astype(np.uint32))
         
         # Model parameters
         params = {
