@@ -1,5 +1,5 @@
-# Enhanced XGBoost AFT Survival Analysis with XGBSE Integration
-# Advanced implementation with proper AFT handling and comprehensive validation
+# Enhanced XGBoost AFT Survival Analysis
+# Advanced implementation with proper AFT handling and comprehensive Kaplan-Meier insights
 
 import pandas as pd
 import numpy as np
@@ -17,15 +17,6 @@ import warnings
 from dataclasses import dataclass
 from enum import Enum
 
-# Optional XGBSE integration
-try:
-    from xgbse import XGBSEKaplanNeighbors, XGBSEKaplanTree, XGBSEDebiasedBCE
-    from xgbse.converters import convert_to_structured_array, convert_y
-    XGBSE_AVAILABLE = True
-except ImportError:
-    XGBSE_AVAILABLE = False
-    print("XGBSE not available. Using manual AFT implementation only.")
-
 warnings.filterwarnings("ignore")
 
 plt.style.use("default")
@@ -38,51 +29,30 @@ class AFTDistribution(Enum):
     LOGISTIC = "logistic"
     EXTREME = "extreme"
 
-class XGBSEMethod(Enum):
-    KAPLAN_NEIGHBORS = "kaplan_neighbors"
-    KAPLAN_TREE = "kaplan_tree"
-    DEBIASED_BCE = "debiased_bce"
-
 @dataclass
 class AFTParameters:
     eta: np.ndarray
     sigma: float
     distribution: AFTDistribution
 
-@dataclass
-class XGBSEParameters:
-    model: object
-    method: XGBSEMethod
-    time_bins: np.ndarray
-
 class EnhancedSurvivalAnalysis:
     """
-    Advanced XGBoost AFT survival analysis with XGBSE integration
+    Advanced XGBoost AFT survival analysis with comprehensive Kaplan-Meier insights
     
-    Provides both manual AFT implementation and XGBSE-based survival curve generation
-    with comprehensive validation and business-focused analytics.
+    Provides proper AFT implementation with comprehensive validation and 
+    business-focused analytics including industry, demographic, and temporal analysis.
     """
     
-    def __init__(self, data: pd.DataFrame, 
-                 aft_distribution: AFTDistribution = AFTDistribution.NORMAL,
-                 use_xgbse: bool = False,
-                 xgbse_method: XGBSEMethod = XGBSEMethod.KAPLAN_NEIGHBORS):
+    def __init__(self, data: pd.DataFrame, aft_distribution: AFTDistribution = AFTDistribution.NORMAL):
         self.data = self._prepare_data(data)
         self.aft_distribution = aft_distribution
-        self.use_xgbse = use_xgbse and XGBSE_AVAILABLE
-        self.xgbse_method = xgbse_method
         self.kmf = KaplanMeierFitter()
         self.insights = {}
         self.enhanced_results = {}
         self.model_parameters = None
-        self.xgbse_parameters = None
         self.survival_curves = None
         self.calibration_metrics = {}
         self.time_points = None
-        
-        if use_xgbse and not XGBSE_AVAILABLE:
-            print("XGBSE requested but not available. Falling back to manual AFT implementation.")
-            self.use_xgbse = False
         
     def _prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepare analysis dataset with business segments"""
@@ -171,9 +141,250 @@ class EnhancedSurvivalAnalysis:
         self.insights["baseline"] = metrics
         return metrics
     
+    def analyze_industries(self, top_n: int = 10) -> Dict:
+        """Analyze retention by industry (NAICS 2-digit) using train val split"""
+        print("Analyzing industry retention patterns...")
+        
+        train_data = self.data[self.data["dataset_split"].isin(["train", "val"])]
+        
+        # Get top industries by volume
+        industry_counts = train_data["naics_2digit"].value_counts()
+        top_industries = industry_counts.head(top_n).index.tolist()
+        
+        # Filter for meaningful sample sizes
+        valid_industries = []
+        for industry in top_industries:
+            if industry_counts[industry] >= 1000:
+                valid_industries.append(industry)
+                
+        industry_data = train_data[train_data["naics_2digit"].isin(valid_industries)]
+        industry_metrics = {}
+        
+        fig, ax = plt.subplots(figsize=(14, 10))
+        colors = sns.color_palette("husl", len(valid_industries))
+        
+        for i, industry in enumerate(valid_industries):
+            subset = industry_data[industry_data["naics_2digit"] == industry]
+            
+            kmf = KaplanMeierFitter()
+            kmf.fit(subset["survival_time_days"], subset["event_indicator"])
+            
+            industry_metrics[industry] = {
+                "sample_size": len(subset),
+                "event_rate": subset["event_indicator"].mean(),
+                "median_survival": kmf.median_survival_time_,
+                "retention_90d": kmf.survival_function_at_times(90).iloc[0],
+                "retention_365d": kmf.survival_function_at_times(365).iloc[0],
+            }
+            
+            kmf.plot_survival_function(
+                ax=ax,
+                ci_show=False,
+                color=colors[i],
+                label=f"NAICS {industry} (n={len(subset):,})",
+            )
+            
+        ax.set_title(
+            f"Retention by Industry - Top {len(valid_industries)} Industries",
+            fontsize=17,
+            fontweight="bold",
+        )
+        ax.set_xlabel("Days Since Assignment Start", fontsize=14)
+        ax.set_ylabel("Survival Probability", fontsize=14)
+        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("industry_survival.png", dpi=300, bbox_inches="tight")
+        plt.show()
+        
+        # Industry ranking
+        ranked = sorted(
+            industry_metrics.items(), key=lambda x: x[1]["retention_365d"], reverse=True
+        )
+        
+        print(f"INDUSTRY PERFORMANCE RANKING:")
+        print("Top Performers:")
+        for i, (industry, metrics) in enumerate(ranked[:3]):
+            print(
+                f"   {i+1}. NAICS {industry}: {metrics['retention_365d']:.1%} retention (n={metrics['sample_size']:,})"
+            )
+            
+        print("Attention Needed:")
+        for i, (industry, metrics) in enumerate(ranked[-3:]):
+            print(
+                f"   NAICS {industry}: {metrics['retention_365d']:.1%} retention (n={metrics['sample_size']:,})"
+            )
+            
+        performance_gap = (
+            ranked[0][1]["retention_365d"] - ranked[-1][1]["retention_365d"]
+        )
+        print(f"\nIndustry opportunity: {performance_gap:.1%} retention gap")
+        
+        self.insights["industry"] = {"metrics": industry_metrics, "ranked": ranked}
+        return industry_metrics
+    
+    def analyze_demographics(self) -> Dict:
+        """Analyze retention by key demographic segments using train val split"""
+        print("Analyzing demographic retention patterns...")
+        
+        train_data = self.data[self.data["dataset_split"].isin(["train", "val"])]
+        
+        demographics = {
+            "age_group": "Age Segments",
+            "tenure_group": "Tenure Segments",
+            "salary_group": "Salary Segments",
+        }
+        
+        demo_insights = {}
+        
+        for demo_col, title in demographics.items():
+            demo_data = train_data[train_data[demo_col].notna()]
+            
+            fig, ax = plt.subplots(figsize=(15, 10))
+            category_metrics = {}
+            
+            categories = (
+                demo_data[demo_col].cat.categories
+                if hasattr(demo_data[demo_col], "cat")
+                else demo_data[demo_col].unique()
+            )
+            
+            for category in categories:
+                subset = demo_data[demo_data[demo_col] == category]
+                
+                if len(subset) < 500:
+                    continue
+                    
+                kmf = KaplanMeierFitter()
+                kmf.fit(subset["survival_time_days"], subset["event_indicator"])
+                
+                category_metrics[str(category)] = {
+                    "sample_size": len(subset),
+                    "event_rate": subset["event_indicator"].mean(),
+                    "median_survival": kmf.median_survival_time_,
+                    "retention_365d": kmf.survival_function_at_times(365).iloc[0],
+                }
+                
+                kmf.plot_survival_function(
+                    ax=ax, ci_show=False, label=f"{category} (n={len(subset):,})"
+                )
+                
+            ax.set_title(f"Retention by {title}", fontsize=17, fontweight="bold")
+            ax.set_xlabel("Days Since Assignment Start", fontsize=14)
+            ax.set_ylabel("Survival Probability", fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f"{demo_col}_survival.png", dpi=300, bbox_inches="tight")
+            plt.show()
+            
+            if category_metrics:
+                ranked_categories = sorted(
+                    category_metrics.items(),
+                    key=lambda x: x[1]["retention_365d"],
+                    reverse=True,
+                )
+                
+                print(f"\n{title.upper()} INSIGHTS:")
+                print("Best performing:")
+                for category, metrics in ranked_categories[:2]:
+                    print(
+                        f"   {category}: {metrics['retention_365d']:.1%} retention (n={metrics['sample_size']:,})"
+                    )
+                    
+                print("Needs attention:")
+                for category, metrics in ranked_categories[-2:]:
+                    print(
+                        f"   {category}: {metrics['retention_365d']:.1%} retention (n={metrics['sample_size']:,})"
+                    )
+                    
+            demo_insights[demo_col] = category_metrics
+            
+        self.insights["demographics"] = demo_insights
+        return demo_insights
+    
+    def analyze_temporal_trends(self) -> Dict:
+        """Compare retention trends: 2023 (train+val) vs 2024 (oot)"""
+        print("Analyzing temporal retention trends...")
+        
+        cohort_2023 = self.data[self.data["dataset_split"].isin(["train", "val"])]
+        cohort_2024 = self.data[self.data["dataset_split"] == "oot"]
+        
+        if len(cohort_2024) < 1000:
+            print("Insufficient 2024 data for temporal analysis")
+            return {}
+            
+        fig, ax = plt.subplots(figsize=(15, 10))
+        
+        # Fit survival curves
+        kmf_2023 = KaplanMeierFitter()
+        kmf_2023.fit(cohort_2023["survival_time_days"], cohort_2023["event_indicator"])
+        
+        kmf_2024 = KaplanMeierFitter()
+        kmf_2024.fit(cohort_2024["survival_time_days"], cohort_2024["event_indicator"])
+        
+        # Plot comparison
+        kmf_2023.plot_survival_function(
+            ax=ax,
+            ci_show=False,
+            linewidth=3,
+            color="blue",
+            label=f"2023 Cohort (n={len(cohort_2023):,})",
+        )
+        kmf_2024.plot_survival_function(
+            ax=ax,
+            ci_show=False,
+            linewidth=3,
+            color="red",
+            label=f"2024 Cohort (n={len(cohort_2024):,})",
+        )
+        
+        ax.set_title(
+            "Temporal Retention Trends: 2023 vs 2024", fontsize=17, fontweight="bold"
+        )
+        ax.set_xlabel("Days Since Assignment Start", fontsize=14)
+        ax.set_ylabel("Survival Probability", fontsize=14)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("temporal_trends.png", dpi=300, bbox_inches="tight")
+        plt.show()
+        
+        # Calculate metrics
+        trend_metrics = {
+            "2023_size": len(cohort_2023),
+            "2024_size": len(cohort_2024),
+            "2023_retention_90d": kmf_2023.survival_function_at_times(90).iloc[0],
+            "2024_retention_90d": kmf_2024.survival_function_at_times(90).iloc[0],
+            "2023_retention_365d": kmf_2023.survival_function_at_times(365).iloc[0],
+            "2024_retention_365d": kmf_2024.survival_function_at_times(365).iloc[0],
+            "2023_median_survival": kmf_2023.median_survival_time_,
+            "2024_median_survival": kmf_2024.median_survival_time_,
+        }
+        
+        # Calculate changes
+        retention_change_90d = (
+            trend_metrics["2024_retention_90d"] - trend_metrics["2023_retention_90d"]
+        )
+        retention_change_365d = (
+            trend_metrics["2024_retention_365d"] - trend_metrics["2023_retention_365d"]
+        )
+        
+        print(f"TEMPORAL TRENDS:")
+        print(f"   2023 cohort: {trend_metrics['2023_size']:,} employees")
+        print(f"   2024 cohort: {trend_metrics['2024_size']:,} employees")
+        print(f"   90-day retention change: {retention_change_90d:+.1%}")
+        print(f"   1-year retention change: {retention_change_365d:+.1%}")
+        
+        trend_metrics["retention_change_90d"] = retention_change_90d
+        trend_metrics["retention_change_365d"] = retention_change_365d
+        
+        self.insights["temporal"] = trend_metrics
+        return trend_metrics
+    
     def build_enhanced_predictive_model(self) -> Dict:
-        """Build enhanced XGBoost model with AFT or XGBSE"""
-        print(f"Building enhanced model with {'XGBSE' if self.use_xgbse else 'AFT'} approach...")
+        """Build enhanced XGBoost AFT model"""
+        print("Building enhanced XGBoost AFT predictive model...")
         
         train_data = self.data[self.data['dataset_split'] == 'train']
         val_data = self.data[self.data['dataset_split'] == 'val']
@@ -214,34 +425,7 @@ class EnhancedSurvivalAnalysis:
         y_val = val_model_data['survival_time_days']
         event_val = val_model_data['event_indicator']
         
-        if self.use_xgbse:
-            performance_metrics = self._build_xgbse_model(
-                X_train, y_train, event_train, X_val, y_val, event_val
-            )
-        else:
-            performance_metrics = self._build_aft_model(
-                X_train, y_train, event_train, X_val, y_val, event_val
-            )
-        
-        self.model_data = {
-            'X_train': X_train, 'y_train': y_train, 'event_train': event_train,
-            'X_val': X_val, 'y_val': y_val, 'event_val': event_val,
-            'feature_columns': feature_columns, 'label_encoders': label_encoders
-        }
-        
-        self._plot_feature_importance()
-        
-        print(f"MODEL PERFORMANCE:")
-        print(f"   Training size: {len(train_model_data):,}")
-        print(f"   Validation size: {len(val_model_data):,}")
-        print(f"   C-index (validation): {performance_metrics['c_index_val']:.3f}")
-        print(f"   Method: {'XGBSE' if self.use_xgbse else 'AFT'}")
-        
-        self.insights['enhanced_model'] = performance_metrics
-        return performance_metrics
-    
-    def _build_aft_model(self, X_train, y_train, event_train, X_val, y_val, event_val) -> Dict:
-        """Build standard AFT model"""
+        # Train AFT model
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dval = xgb.DMatrix(X_val, label=y_val)
         
@@ -273,83 +457,68 @@ class EnhancedSurvivalAnalysis:
         )
         
         self.model = model
+        self.model_data = {
+            'X_train': X_train, 'y_train': y_train, 'event_train': event_train,
+            'X_val': X_val, 'y_val': y_val, 'event_val': event_val,
+            'feature_columns': feature_columns, 'label_encoders': label_encoders
+        }
+        
+        # Estimate AFT parameters
         self.model_parameters = self._estimate_aft_parameters()
         
+        # Calculate performance metrics
         train_pred = model.predict(dtrain)
         val_pred = model.predict(dval)
         
         c_index_train = concordance_index(y_train, train_pred, event_train)
         c_index_val = concordance_index(y_val, val_pred, event_val)
         
-        return {
-            'c_index_train': c_index_train,
-            'c_index_val': c_index_val,
-            'model_type': 'AFT',
-            'distribution': self.aft_distribution.value
-        }
-    
-    def _build_xgbse_model(self, X_train, y_train, event_train, X_val, y_val, event_val) -> Dict:
-        """Build XGBSE model"""
-        y_train_structured = convert_to_structured_array(y_train, event_train)
-        y_val_structured = convert_to_structured_array(y_val, event_val)
+        # Feature importance
+        feature_importance = model.get_score(importance_type='gain')
         
-        if self.xgbse_method == XGBSEMethod.KAPLAN_NEIGHBORS:
-            model = XGBSEKaplanNeighbors(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42
-            )
-        elif self.xgbse_method == XGBSEMethod.KAPLAN_TREE:
-            model = XGBSEKaplanTree(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42
-            )
-        else:  # DEBIASED_BCE
-            model = XGBSEDebiasedBCE(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42
-            )
-        
-        model.fit(X_train, y_train_structured)
-        self.model = model
-        
-        time_bins = np.arange(1, 366, 1)
-        self.xgbse_parameters = XGBSEParameters(
-            model=model,
-            method=self.xgbse_method,
-            time_bins=time_bins
-        )
-        
-        train_pred = model.predict(X_train)
-        val_pred = model.predict(X_val)
-        
-        if hasattr(train_pred, 'iloc'):
-            train_pred_concordance = train_pred.iloc[:, -1]
-            val_pred_concordance = val_pred.iloc[:, -1]
+        if feature_importance and list(feature_importance.keys())[0].startswith("f"):
+            importance_df = pd.DataFrame([
+                {'feature': feature_columns[int(f[1:])], 'importance': score}
+                for f, score in feature_importance.items()
+            ]).sort_values('importance', ascending=False)
         else:
-            train_pred_concordance = train_pred[:, -1]
-            val_pred_concordance = val_pred[:, -1]
+            importance_df = pd.DataFrame([
+                {'feature': f, 'importance': score}
+                for f, score in feature_importance.items()
+            ]).sort_values('importance', ascending=False)
         
-        c_index_train = concordance_index(y_train, train_pred_concordance, event_train)
-        c_index_val = concordance_index(y_val, val_pred_concordance, event_val)
+        # Enhanced diagnostics
+        prediction_stats = {
+            'train_pred_mean': train_pred.mean(),
+            'train_pred_std': train_pred.std(),
+            'val_pred_mean': val_pred.mean(),
+            'val_pred_std': val_pred.std(),
+            'prediction_range': val_pred.max() - val_pred.min(),
+            'unique_predictions': len(np.unique(val_pred))
+        }
         
-        return {
+        performance_metrics = {
+            'train_size': len(train_model_data),
+            'val_size': len(val_model_data),
             'c_index_train': c_index_train,
             'c_index_val': c_index_val,
-            'model_type': 'XGBSE',
-            'method': self.xgbse_method.value
+            'feature_importance': importance_df,
+            'prediction_stats': prediction_stats,
+            'aft_distribution': self.aft_distribution.value
         }
+        
+        self._plot_feature_importance(importance_df)
+        
+        print(f"MODEL PERFORMANCE:")
+        print(f"   Training size: {len(train_model_data):,}")
+        print(f"   Validation size: {len(val_model_data):,}")
+        print(f"   C-index (validation): {c_index_val:.3f}")
+        print(f"   AFT distribution: {self.aft_distribution.value}")
+        if self.model_parameters:
+            print(f"   Scale parameter: {self.model_parameters.sigma:.3f}")
+        
+        self.insights['enhanced_model'] = performance_metrics
+        return performance_metrics
     
     def _process_features(self, train_data: pd.DataFrame, val_data: pd.DataFrame,
                          numeric_features: List[str], categorical_features: List[str]) -> Tuple:
@@ -380,7 +549,7 @@ class EnhancedSurvivalAnalysis:
             train_data['naics_encoded'] = train_naics.map(naics_mapping)
             val_data['naics_encoded'] = val_naics.map(naics_mapping)
             
-            numeric_features.append('naics_encoded')
+            numeric_features = numeric_features + ['naics_encoded']
             label_encoders['naics_2digit'] = naics_mapping
         
         encoded_categorical = [f'{cat}_encoded' for cat in categorical_features]
@@ -429,37 +598,12 @@ class EnhancedSurvivalAnalysis:
             distribution=self.aft_distribution
         )
     
-    def _plot_feature_importance(self):
+    def _plot_feature_importance(self, importance_df: pd.DataFrame):
         """Plot feature importance"""
-        if self.use_xgbse:
-            if hasattr(self.model, 'feature_importances_'):
-                importances = self.model.feature_importances_
-                feature_names = self.model_data['feature_columns']
-                importance_df = pd.DataFrame({
-                    'feature': feature_names,
-                    'importance': importances
-                }).sort_values('importance', ascending=False)
-            else:
-                print("Feature importance not available for this XGBSE model")
-                return
-        else:
-            feature_importance = self.model.get_score(importance_type='gain')
-            feature_columns = self.model_data['feature_columns']
-            
-            if feature_importance and list(feature_importance.keys())[0].startswith("f"):
-                importance_df = pd.DataFrame([
-                    {'feature': feature_columns[int(f[1:])], 'importance': score}
-                    for f, score in feature_importance.items()
-                ]).sort_values('importance', ascending=False)
-            else:
-                importance_df = pd.DataFrame([
-                    {'feature': f, 'importance': score}
-                    for f, score in feature_importance.items()
-                ]).sort_values('importance', ascending=False)
-        
         fig, ax = plt.subplots(figsize=(12, 8))
         sns.barplot(data=importance_df.head(15), x='importance', y='feature', ax=ax)
-        ax.set_title('Feature Importance - Enhanced Model', fontsize=16, fontweight='bold')
+        ax.set_title('Feature Importance - Enhanced XGBoost AFT Model', 
+                    fontsize=16, fontweight='bold')
         ax.set_xlabel('Importance Score', fontsize=12)
         ax.set_ylabel('Features', fontsize=12)
         plt.tight_layout()
@@ -467,17 +611,10 @@ class EnhancedSurvivalAnalysis:
         plt.show()
     
     def generate_survival_curves(self, X_test: pd.DataFrame, time_points: Optional[np.ndarray] = None) -> np.ndarray:
-        """Generate survival curves using AFT or XGBSE"""
+        """Generate mathematically correct survival curves for AFT models"""
         if time_points is None:
             time_points = np.arange(1, 366, 1)
         
-        if self.use_xgbse:
-            return self._generate_xgbse_survival_curves(X_test, time_points)
-        else:
-            return self._generate_aft_survival_curves(X_test, time_points)
-    
-    def _generate_aft_survival_curves(self, X_test: pd.DataFrame, time_points: np.ndarray) -> np.ndarray:
-        """Generate AFT survival curves"""
         if self.model_parameters is None:
             raise ValueError("Model parameters not estimated. Run build_enhanced_predictive_model() first.")
         
@@ -487,6 +624,7 @@ class EnhancedSurvivalAnalysis:
         print(f"AFT Survival Curve Generation:")
         print(f"   Location parameters - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
         print(f"   Scale parameter: {self.model_parameters.sigma:.3f}")
+        print(f"   Distribution: {self.aft_distribution.value}")
         
         survival_curves = []
         
@@ -520,62 +658,23 @@ class EnhancedSurvivalAnalysis:
         
         return self.survival_curves
     
-    def _generate_xgbse_survival_curves(self, X_test: pd.DataFrame, time_points: np.ndarray) -> np.ndarray:
-        """Generate XGBSE survival curves"""
-        print(f"XGBSE Survival Curve Generation:")
-        print(f"   Method: {self.xgbse_method.value}")
-        
-        survival_curves = self.model.predict(X_test)
-        
-        if hasattr(survival_curves, 'values'):
-            survival_curves = survival_curves.values
-        
-        # Interpolate to match requested time points
-        if hasattr(self.xgbse_parameters, 'time_bins'):
-            original_times = self.xgbse_parameters.time_bins
-            if len(original_times) != len(time_points) or not np.array_equal(original_times, time_points):
-                interpolated_curves = []
-                for curve in survival_curves:
-                    interp_func = interpolate.interp1d(original_times, curve, 
-                                                     kind='linear', bounds_error=False, 
-                                                     fill_value=(curve[0], curve[-1]))
-                    interpolated_curves.append(interp_func(time_points))
-                survival_curves = np.array(interpolated_curves)
-        
-        self.survival_curves = survival_curves
-        self.time_points = time_points
-        
-        final_survival = self.survival_curves[:, -1]
-        print(f"   Final survival probabilities - Mean: {final_survival.mean():.3f}, Std: {final_survival.std():.3f}")
-        
-        return self.survival_curves
-    
     def calculate_risk_scores(self, predictions: np.ndarray) -> np.ndarray:
-        """Calculate risk scores for AFT models"""
-        if self.use_xgbse:
-            if hasattr(predictions, 'iloc'):
-                risk_scores = 1 - predictions.iloc[:, -1]
-            else:
-                risk_scores = 1 - predictions[:, -1]
-        else:
-            risk_scores = -predictions
-            risk_scores = risk_scores - risk_scores.min()
-            if risk_scores.max() > 0:
-                risk_scores = risk_scores / risk_scores.max()
+        """Calculate mathematically correct risk scores for AFT models"""
+        risk_scores = -predictions
+        risk_scores = risk_scores - risk_scores.min()
+        if risk_scores.max() > 0:
+            risk_scores = risk_scores / risk_scores.max()
         
         return risk_scores
     
     def calculate_enhanced_lorenz_curve(self, y_true: np.ndarray, y_pred_raw: np.ndarray) -> float:
         """Calculate Lorenz curve with comprehensive decile analysis"""
-        if self.use_xgbse:
-            risk_scores = self.calculate_risk_scores(y_pred_raw)
-        else:
-            risk_scores = self.calculate_risk_scores(y_pred_raw)
+        risk_scores = self.calculate_risk_scores(y_pred_raw)
         
         df = pd.DataFrame({
             'event': y_true,
             'predicted_risk': risk_scores,
-            'raw_prediction': y_pred_raw.flatten() if hasattr(y_pred_raw, 'flatten') else y_pred_raw
+            'raw_prediction': y_pred_raw
         })
         
         print(f"Enhanced Lorenz Curve Calculation:")
@@ -886,36 +985,25 @@ class EnhancedSurvivalAnalysis:
         y_val = self.model_data['y_val']
         event_val = self.model_data['event_val']
         
-        if self.use_xgbse:
-            predictions = self.model.predict(X_val)
-            if hasattr(predictions, 'iloc'):
-                predictions_1d = predictions.iloc[:, -1]
-            else:
-                predictions_1d = predictions[:, -1]
-        else:
-            dval = xgb.DMatrix(X_val)
-            predictions_1d = self.model.predict(dval)
+        dval = xgb.DMatrix(X_val)
+        predictions = self.model.predict(dval)
         
         print("1. PREDICTION DISTRIBUTION:")
-        print(f"   Mean: {predictions_1d.mean():.3f}")
-        print(f"   Std: {predictions_1d.std():.3f}")
-        print(f"   Range: [{predictions_1d.min():.3f}, {predictions_1d.max():.3f}]")
+        print(f"   Mean: {predictions.mean():.3f}")
+        print(f"   Std: {predictions.std():.3f}")
+        print(f"   Range: [{predictions.min():.3f}, {predictions.max():.3f}]")
         
         print("\n2. DIRECTIONAL VALIDATION:")
-        high_pred_mask = predictions_1d >= np.median(predictions_1d)
-        low_pred_mask = predictions_1d < np.median(predictions_1d)
+        high_pred_mask = predictions >= np.median(predictions)
+        low_pred_mask = predictions < np.median(predictions)
         
         high_survival = y_val[high_pred_mask].mean()
         low_survival = y_val[low_pred_mask].mean()
         high_event_rate = event_val[high_pred_mask].mean()
         low_event_rate = event_val[low_pred_mask].mean()
         
-        if self.use_xgbse:
-            direction_correct = high_survival > low_survival
-            event_direction_correct = high_event_rate < low_event_rate
-        else:
-            direction_correct = high_survival > low_survival
-            event_direction_correct = high_event_rate < low_event_rate
+        direction_correct = high_survival > low_survival
+        event_direction_correct = high_event_rate < low_event_rate
         
         print(f"   High predictions longer survival: {direction_correct}")
         print(f"   High predictions lower event rate: {event_direction_correct}")
@@ -943,7 +1031,7 @@ class EnhancedSurvivalAnalysis:
                 'event_direction_correct': event_direction_correct
             },
             'survival_curve_variance': final_survival.std() if self.survival_curves is not None else None,
-            'model_approach': 'XGBSE' if self.use_xgbse else 'AFT'
+            'model_approach': 'AFT'
         }
     
     def run_comprehensive_analysis(self) -> Dict:
@@ -954,30 +1042,35 @@ class EnhancedSurvivalAnalysis:
         print("\n1. Baseline Analysis...")
         self.analyze_baseline()
         
-        print("\n2. Enhanced Predictive Modeling...")
+        print("\n2. Industry Analysis...")
+        self.analyze_industries()
+        
+        print("\n3. Demographic Analysis...")
+        self.analyze_demographics()
+        
+        print("\n4. Temporal Trends Analysis...")
+        self.analyze_temporal_trends()
+        
+        print("\n5. Enhanced Predictive Modeling...")
         self.build_enhanced_predictive_model()
         
-        print("\n3. Generating Survival Curves...")
+        print("\n6. Generating Survival Curves...")
         X_val = self.model_data['X_val']
         self.generate_survival_curves(X_val)
         self.plot_enhanced_survival_curves()
         
-        print("\n4. Enhanced Risk Assessment...")
+        print("\n7. Enhanced Risk Assessment...")
         y_val = self.model_data['y_val']
         event_val = self.model_data['event_val']
-        
-        if self.use_xgbse:
-            raw_predictions = self.model.predict(X_val)
-        else:
-            raw_predictions = self.model.predict(xgb.DMatrix(X_val))
+        raw_predictions = self.model.predict(xgb.DMatrix(X_val))
         
         gini = self.calculate_enhanced_lorenz_curve(event_val, raw_predictions)
         self.plot_enhanced_lorenz_analysis()
         
-        print("\n5. Model Validation...")
+        print("\n8. Model Validation...")
         validation_results = self.validate_enhanced_model()
         
-        print("\n6. Generating Summary...")
+        print("\n9. Generating Summary...")
         summary = self.generate_comprehensive_summary()
         
         print("\n" + "="*60)
@@ -989,8 +1082,7 @@ class EnhancedSurvivalAnalysis:
             'enhanced_results': self.enhanced_results,
             'validation_results': validation_results,
             'summary': summary,
-            'model_parameters': self.model_parameters,
-            'xgbse_parameters': self.xgbse_parameters
+            'model_parameters': self.model_parameters
         }
     
     def generate_comprehensive_summary(self) -> Dict:
@@ -1002,22 +1094,18 @@ class EnhancedSurvivalAnalysis:
             "population_size": baseline.get('population_size', 'N/A'),
             "retention_365d": baseline.get('retention_365d', 'N/A'),
             "model_c_index": model_results.get('c_index_val', 'N/A'),
-            "model_approach": 'XGBSE' if self.use_xgbse else 'AFT',
+            "aft_distribution": self.aft_distribution.value,
+            "scale_parameter": self.model_parameters.sigma if self.model_parameters else 'N/A',
             "gini_coefficient": self.enhanced_results.get('enhanced_lorenz_curve', {}).get('gini_coefficient', 'N/A')
         }
-        
-        if self.use_xgbse:
-            summary["xgbse_method"] = self.xgbse_method.value
-        else:
-            summary["aft_distribution"] = self.aft_distribution.value
-            summary["scale_parameter"] = self.model_parameters.sigma if self.model_parameters else 'N/A'
         
         print("\nCOMPREHENSIVE SUMMARY:")
         print("=" * 30)
         print(f"Population: {summary['population_size']}")
         print(f"1-year retention: {summary['retention_365d']}")
         print(f"Model C-index: {summary['model_c_index']}")
-        print(f"Model approach: {summary['model_approach']}")
+        print(f"AFT distribution: {summary['aft_distribution']}")
+        print(f"Scale parameter: {summary['scale_parameter']}")
         print(f"Gini coefficient: {summary['gini_coefficient']}")
         
         return summary
@@ -1028,27 +1116,22 @@ def run_analysis_demo():
     print("=" * 50)
     
     capabilities = [
+        "Comprehensive Kaplan-Meier analysis (baseline, industry, demographics, temporal)",
         "Proper AFT distribution handling (normal/logistic/extreme)",
-        "XGBSE integration with multiple methods",
         "Mathematically correct risk scoring",
         "Comprehensive decile analysis with business metrics",
         "Enhanced survival curve generation",
         "Robust model validation framework",
         "Creative Lorenz curve visualizations",
-        "Distribution flexibility and comparison"
+        "Distribution flexibility for different data patterns"
     ]
     
     print("\nKEY CAPABILITIES:")
     for cap in capabilities:
         print(f"   - {cap}")
     
-    print("\nUSAGE EXAMPLES:")
-    print("   # AFT approach")
+    print("\nUSAGE EXAMPLE:")
     print("   analyzer = EnhancedSurvivalAnalysis(data, AFTDistribution.NORMAL)")
-    print("   results = analyzer.run_comprehensive_analysis()")
-    print("")
-    print("   # XGBSE approach")
-    print("   analyzer = EnhancedSurvivalAnalysis(data, use_xgbse=True, xgbse_method=XGBSEMethod.KAPLAN_NEIGHBORS)")
     print("   results = analyzer.run_comprehensive_analysis()")
     
     return "Enhanced analysis ready for deployment"
