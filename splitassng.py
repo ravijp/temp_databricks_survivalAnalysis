@@ -568,18 +568,64 @@ class EnhancedSurvivalAnalysis:
         return train_data, val_data, feature_columns, label_encoders
     
     def _estimate_aft_parameters(self) -> AFTParameters:
-        """Estimate AFT scale parameter from training residuals"""
+        """Estimate AFT scale parameter with proper diagnostics to identify root issues"""
         X_train = self.model_data['X_train']
         y_train = self.model_data['y_train']
         
         dtrain = xgb.DMatrix(X_train)
-        eta_predictions = self.model.predict(dtrain)  # These are log-scale location parameters
+        eta_predictions = self.model.predict(dtrain)
         
-        # Calculate residuals in log space: log(actual) - predicted_log_scale
+        # Comprehensive diagnostics to understand the root issue
         log_actual = np.log(y_train)
+        
+        print(f"ROOT CAUSE ANALYSIS:")
+        print(f"=" * 50)
+        print(f"TARGET VARIABLE ANALYSIS:")
+        print(f"   Survival times - Min: {y_train.min():.1f}, Max: {y_train.max():.1f}, Mean: {y_train.mean():.1f}")
+        print(f"   Log survival times - Min: {log_actual.min():.3f}, Max: {log_actual.max():.3f}, Mean: {log_actual.mean():.3f}")
+        print(f"   Expected log range for days: [0, 6] (1 day to 365 days)")
+        
+        print(f"\nMODEL PREDICTIONS ANALYSIS:")
+        print(f"   Raw predictions - Min: {eta_predictions.min():.3f}, Max: {eta_predictions.max():.3f}, Mean: {eta_predictions.mean():.3f}")
+        print(f"   Prediction std: {eta_predictions.std():.3f}")
+        print(f"   Expected range: should be similar to log(survival_times)")
+        
+        print(f"\nFEATURE SCALING CHECK:")
+        feature_means = X_train.mean()
+        feature_stds = X_train.std()
+        large_features = []
+        for i, (mean, std) in enumerate(zip(feature_means, feature_stds)):
+            if abs(mean) > 1000 or std > 1000:
+                large_features.append((self.model_data['feature_columns'][i], mean, std))
+        
+        if large_features:
+            print(f"   WARNING: Large-scale features detected:")
+            for feat, mean, std in large_features[:5]:  # Show top 5
+                print(f"     {feat}: mean={mean:.1f}, std={std:.1f}")
+            print(f"   Large features can cause large predictions in tree models")
+        else:
+            print(f"   Feature scales appear reasonable")
+        
+        # Check prediction-target relationship
+        correlation = np.corrcoef(eta_predictions, log_actual)[0, 1]
+        print(f"\nPREDICTION-TARGET RELATIONSHIP:")
+        print(f"   Correlation(predictions, log_actual): {correlation:.3f}")
+        
+        # Check if predictions are reasonable relative to targets
+        prediction_target_ratio = eta_predictions.mean() / log_actual.mean()
+        print(f"   Prediction/Target ratio: {prediction_target_ratio:.2f}")
+        
+        if abs(prediction_target_ratio) > 10:
+            print(f"   WARNING: Predictions are {prediction_target_ratio:.1f}x larger than expected!")
+            print(f"   This suggests a fundamental scaling or interpretation issue")
+        
+        # Calculate residuals without any artificial scaling
         log_residuals = log_actual - eta_predictions
         
-        # Estimate scale parameter based on distribution
+        print(f"\nRESIDUAL ANALYSIS:")
+        print(f"   Raw residuals - Mean: {log_residuals.mean():.3f}, Std: {log_residuals.std():.3f}")
+        
+        # Calculate sigma from residuals (this is mathematically correct)
         if self.aft_distribution == AFTDistribution.NORMAL:
             sigma = np.std(log_residuals)
         elif self.aft_distribution == AFTDistribution.LOGISTIC:
@@ -588,22 +634,28 @@ class EnhancedSurvivalAnalysis:
             sigma = np.std(log_residuals) * np.sqrt(6) / np.pi
         else:
             sigma = np.std(log_residuals)
+            
+        print(f"   Calculated sigma: {sigma:.3f}")
         
-        # Ensure reasonable bounds
-        sigma = np.clip(sigma, 0.1, 3.0)
-        
-        print(f"AFT Parameter Estimation:")
-        print(f"   Predictions (η) - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
-        print(f"   Log actual times - Mean: {log_actual.mean():.3f}, Std: {log_actual.std():.3f}")
-        print(f"   Log residuals - Mean: {log_residuals.mean():.3f}, Std: {np.std(log_residuals):.3f}")
-        print(f"   Estimated scale (σ): {sigma:.3f}")
-        
-        # Check for potential issues
-        if eta_predictions.std() < 0.01:
-            print("   WARNING: Very low prediction variance - model may not be learning!")
-        
-        if abs(log_residuals.mean()) > 0.5:
-            print(f"   WARNING: Large bias in predictions (mean residual: {log_residuals.mean():.3f})")
+        # Identify the likely root cause
+        print(f"\nROOT CAUSE ASSESSMENT:")
+        if abs(prediction_target_ratio) > 10:
+            print(f"   PRIMARY ISSUE: Prediction scale mismatch")
+            print(f"   LIKELY CAUSES:")
+            if large_features:
+                print(f"     - Large feature values (need feature scaling)")
+            print(f"     - XGBoost hyperparameters (learning rate, regularization)")
+            print(f"     - Model overfitting to training noise")
+            print(f"   SOLUTIONS:")
+            print(f"     - Apply feature scaling (StandardScaler, MinMaxScaler)")  
+            print(f"     - Reduce learning rate (eta)")
+            print(f"     - Increase regularization (reg_alpha, reg_lambda)")
+            print(f"     - Add early stopping")
+        elif eta_predictions.std() < 0.01:
+            print(f"   PRIMARY ISSUE: Model not learning (low variance)")
+            print(f"   SOLUTIONS: Reduce regularization, increase learning rate")
+        else:
+            print(f"   Model appears to be learning with reasonable scale")
         
         return AFTParameters(
             eta=eta_predictions,
@@ -635,11 +687,23 @@ class EnhancedSurvivalAnalysis:
         eta_predictions = self.model.predict(dtest)  # These are log-scale location parameters
         
         print(f"AFT Survival Curve Generation:")
-        print(f"   Location parameters (η) - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
+        print(f"   Raw predictions (η) - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
         print(f"   Scale parameter (σ): {self.model_parameters.sigma:.3f}")
         print(f"   Distribution: {self.aft_distribution.value}")
         
-        # Check if model is learning (predictions should have variance)
+        # Check if predictions are in reasonable range for log(days)
+        # Reasonable log(days) should be roughly 0 to 10 (1 day to ~22k days)
+        if eta_predictions.mean() > 50:
+            print(f"   WARNING: η values very large (mean={eta_predictions.mean():.1f})")
+            print(f"   This suggests model interpretation or scaling issues")
+            print(f"   Expected η range for days: roughly 0-10, but got mean {eta_predictions.mean():.1f}")
+            
+            # Apply bounds to prevent astronomical survival times
+            eta_predictions = np.clip(eta_predictions, 0, 15)  # Limit to reasonable range
+            print(f"   Applied bounds: η clipped to [0, 15]")
+            print(f"   Bounded predictions - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
+        
+        # Check if predictions have adequate variance
         if eta_predictions.std() < 0.01:
             print("   WARNING: Very low prediction variance - model may not be learning!")
         
@@ -675,23 +739,37 @@ class EnhancedSurvivalAnalysis:
         self.survival_curves = np.array(survival_curves)
         self.time_points = time_points
         
-        # Diagnostic information
+        # Enhanced diagnostic information
         final_survival = self.survival_curves[:, -1]
         initial_survival = self.survival_curves[:, 0]
+        survival_at_30 = self.survival_curves[:, 29] if len(self.survival_curves[0]) > 29 else final_survival
+        survival_at_90 = self.survival_curves[:, 89] if len(self.survival_curves[0]) > 89 else final_survival
         
         print(f"   Survival Curve Diagnostics:")
         print(f"     Initial survival (t=1) - Mean: {initial_survival.mean():.3f}, Std: {initial_survival.std():.3f}")
+        print(f"     30-day survival - Mean: {survival_at_30.mean():.3f}, Std: {survival_at_30.std():.3f}")
+        print(f"     90-day survival - Mean: {survival_at_90.mean():.3f}, Std: {survival_at_90.std():.3f}")
         print(f"     Final survival (t=365) - Mean: {final_survival.mean():.3f}, Std: {final_survival.std():.3f}")
-        print(f"     Average decline: {(initial_survival.mean() - final_survival.mean()):.3f}")
+        print(f"     Average decline (1d to 365d): {(initial_survival.mean() - final_survival.mean()):.3f}")
         
-        # Check for issues
+        # Check for common issues and provide specific guidance
         if final_survival.std() < 0.01:
             print("   WARNING: Low variance in final survival probabilities")
-            print("   Possible issues: low prediction variance, inappropriate sigma, or model not learning")
+            print("   Possible issues:")
+            print("     - Low prediction variance (model not learning)")
+            print("     - Scale parameter (σ) too large")
+            print("     - Predictions (η) in wrong scale")
         
         if final_survival.mean() > 0.95:
             print("   WARNING: Very high final survival probabilities")
-            print("   Possible issues: sigma too large, or time horizon too short relative to predictions")
+            print("   Possible issues:")
+            print("     - Scale parameter (σ) too large")
+            print("     - Time horizon too short relative to predictions")
+            print("     - Model predicting unrealistically long survival times")
+        
+        if (initial_survival.mean() - final_survival.mean()) < 0.1:
+            print("   WARNING: Very small decline in survival over time")
+            print("   This suggests survival curves are too flat")
         
         return self.survival_curves
     
@@ -927,10 +1005,11 @@ class EnhancedSurvivalAnalysis:
         table_data['capture_rate'] = (table_data['capture_rate'] * 100).round(1)
         table_data['cumulative_capture_rate'] = (table_data['cumulative_capture_rate'] * 100).round(1)
         table_data['lift'] = table_data['lift'].round(2)
+        table_data['avg_risk_score'] = table_data['avg_risk_score'].round(3)
         table_data['risk_concentration'] = table_data['risk_concentration'].round(2)
         
         table_data.columns = ['Decile', 'Population', 'Pop %', 'Events', 'Event Rate %', 
-                             'Capture Rate %', 'Cumulative Capture %', 'Lift', 'Risk Concentration']
+                             'Capture Rate %', 'Cumulative Capture %', 'Lift', 'Avg Risk Score', 'Risk Concentration']
         
         table = ax7.table(cellText=table_data.values, colLabels=table_data.columns,
                          cellLoc='center', loc='center')
@@ -941,7 +1020,7 @@ class EnhancedSurvivalAnalysis:
         # Color code the table
         for i in range(len(table_data)):
             if table_data.iloc[i]['Lift'] > 2:
-                table[(i+1, 7)].set_facecolor('#90EE90')  # Light green for high lift
+                table[(i+1, 7)].set_facecolor('#90EE90')  # Light green for high lift (Lift is column 7)
             elif table_data.iloc[i]['Lift'] > 1.5:
                 table[(i+1, 7)].set_facecolor('#FFFFE0')  # Light yellow for moderate lift
         
