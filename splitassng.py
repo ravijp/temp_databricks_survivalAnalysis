@@ -559,17 +559,174 @@ class SurvivalAnalysis:
         # Add prediction diagnostics
         print(f"\nPREDICTION DIAGNOSTICS:")
         print(f"   Raw predictions - Mean: {val_pred.mean():.3f}, Std: {val_pred.std():.3f}")
+        print(f"   Raw predictions - Min: {val_pred.min():.3f}, Max: {val_pred.max():.3f}")
         print(f"   Actual survival times - Mean: {y_val.mean():.1f}, Std: {y_val.std():.1f}")
         print(f"   Event rate: {event_val.mean():.3f}")
         
+        # Check correlation between predictions and actual survival
+        from scipy.stats import pearsonr, spearmanr
+        corr_pearson, p_pearson = pearsonr(val_pred, y_val)
+        corr_spearman, p_spearman = spearmanr(val_pred, y_val)
+        
+        print(f"   Pearson correlation with survival time: {corr_pearson:.3f} (p={p_pearson:.3f})")
+        print(f"   Spearman correlation with survival time: {corr_spearman:.3f} (p={p_spearman:.3f})")
+        
+        # Check if model is just predicting the mean
+        prediction_range = val_pred.max() - val_pred.min()
+        prediction_cv = val_pred.std() / val_pred.mean() if val_pred.mean() != 0 else 0
+        
+        print(f"   Prediction range: {prediction_range:.3f}")
+        print(f"   Prediction coefficient of variation: {prediction_cv:.3f}")
+        
         if val_pred.std() < 0.1:
             print("   WARNING: Low prediction variance - model may not be learning well")
+        
+        if abs(corr_pearson) < 0.1:
+            print("   WARNING: Low correlation with survival time - model may not be predictive")
+        
+        if prediction_cv < 0.1:
+            print("   WARNING: Low prediction variability - model may be predicting near-constant values")
             
         self.insights['model'] = model_results
         return model_results
     
+    def diagnose_model_learning(self):
+        """Comprehensive model learning diagnostics"""
+        if not hasattr(self, 'model') or not hasattr(self, 'model_data'):
+            print("Model not trained yet")
+            return
+        
+        print("\nMODEL LEARNING DIAGNOSTICS:")
+        print("="*50)
+        
+        X_train = self.model_data['X_train']
+        y_train = self.model_data['y_train']
+        X_val = self.model_data['X_val']
+        y_val = self.model_data['y_val']
+        
+        # Get predictions
+        dtrain = xgb.DMatrix(X_train)
+        dval = xgb.DMatrix(X_val)
+        
+        train_pred = self.model.predict(dtrain)
+        val_pred = self.model.predict(dval)
+        
+        # Check if model is just predicting the mean
+        train_mean = y_train.mean()
+        val_mean = y_val.mean()
+        
+        print(f"1. PREDICTION ANALYSIS:")
+        print(f"   Training predictions - Mean: {train_pred.mean():.3f}, Std: {train_pred.std():.3f}")
+        print(f"   Validation predictions - Mean: {val_pred.mean():.3f}, Std: {val_pred.std():.3f}")
+        print(f"   Training target mean: {train_mean:.3f}")
+        print(f"   Validation target mean: {val_mean:.3f}")
+        
+        # Check if predictions are close to target mean
+        train_diff_from_mean = abs(train_pred.mean() - train_mean)
+        val_diff_from_mean = abs(val_pred.mean() - val_mean)
+        
+        print(f"   Train pred vs target mean difference: {train_diff_from_mean:.3f}")
+        print(f"   Val pred vs target mean difference: {val_diff_from_mean:.3f}")
+        
+        # Check prediction variance
+        if train_pred.std() < 10:
+            print("   WARNING: Very low training prediction variance")
+        if val_pred.std() < 10:
+            print("   WARNING: Very low validation prediction variance")
+        
+        # Check if all predictions are identical
+        if len(np.unique(train_pred)) == 1:
+            print("   ERROR: All training predictions are identical!")
+        if len(np.unique(val_pred)) == 1:
+            print("   ERROR: All validation predictions are identical!")
+        
+        print(f"\n2. FEATURE ANALYSIS:")
+        # Check feature variance
+        feature_vars = X_train.var()
+        zero_var_features = feature_vars[feature_vars == 0].index.tolist()
+        low_var_features = feature_vars[feature_vars < 0.01].index.tolist()
+        
+        if zero_var_features:
+            print(f"   Zero variance features: {zero_var_features}")
+        if low_var_features:
+            print(f"   Low variance features: {low_var_features}")
+        
+        # Check for constant features
+        constant_features = []
+        for col in X_train.columns:
+            if X_train[col].nunique() == 1:
+                constant_features.append(col)
+        
+        if constant_features:
+            print(f"   Constant features: {constant_features}")
+        
+        print(f"\n3. MODEL COMPLEXITY:")
+        # Check if model is using features
+        feature_importance = self.model.get_score(importance_type='gain')
+        if not feature_importance:
+            print("   WARNING: No feature importance found - model may not be using features")
+        else:
+            print(f"   Number of features with non-zero importance: {len(feature_importance)}")
+            print(f"   Total features: {len(X_train.columns)}")
+        
+        return {
+            'train_pred_std': train_pred.std(),
+            'val_pred_std': val_pred.std(),
+            'unique_train_preds': len(np.unique(train_pred)),
+            'unique_val_preds': len(np.unique(val_pred)),
+            'zero_var_features': zero_var_features,
+            'constant_features': constant_features
+        }
+    
+    def get_improvement_recommendations(self):
+        """Provide recommendations based on model diagnostics"""
+        if not hasattr(self, 'model'):
+            return []
+        
+        recommendations = []
+        
+        # Check survival curve issues
+        if hasattr(self, 'survival_curves') and self.survival_curves is not None:
+            final_survival = self.survival_curves[:, -1]
+            if final_survival.std() < 0.01:
+                recommendations.append({
+                    'issue': 'Identical Survival Curves',
+                    'severity': 'High',
+                    'recommendation': 'Model predictions lack variance. Consider: 1) Adding more features, 2) Reducing regularization, 3) Increasing model complexity, 4) Checking for data quality issues'
+                })
+        
+        # Check Gini coefficient
+        if 'lorenz_curve' in self.enhanced_results:
+            gini = self.enhanced_results['lorenz_curve']['gini_coefficient']
+            if gini < 0:
+                recommendations.append({
+                    'issue': 'Negative Gini Coefficient',
+                    'severity': 'Critical',
+                    'recommendation': 'Model is performing worse than random. Check: 1) Target variable definition, 2) Feature-target relationships, 3) Data leakage, 4) Model hyperparameters'
+                })
+            elif gini < 0.1:
+                recommendations.append({
+                    'issue': 'Low Gini Coefficient',
+                    'severity': 'High',
+                    'recommendation': 'Poor model discrimination. Consider: 1) Feature engineering, 2) Different model architecture, 3) More training data, 4) Ensemble methods'
+                })
+        
+        # Check model learning
+        X_val = self.model_data['X_val']
+        dval = xgb.DMatrix(X_val)
+        val_pred = self.model.predict(dval)
+        
+        if val_pred.std() < 10:
+            recommendations.append({
+                'issue': 'Low Prediction Variance',
+                'severity': 'High',
+                'recommendation': 'Model predictions have low variance. Try: 1) Reduce regularization (increase eta, reduce lambda), 2) Increase max_depth, 3) Add more diverse features'
+            })
+        
+        return recommendations
+    
     def generate_individual_survival_curves(self, X_test, time_points=None):
-        """Generate individual survival curves with better variance"""
+        """Generate individual survival curves with proper variance"""
         if time_points is None:
             time_points = np.arange(1, 366, 1)
         
@@ -578,20 +735,22 @@ class SurvivalAnalysis:
         predictions = self.model.predict(dtest)
         
         print(f"Raw predictions - Mean: {predictions.mean():.3f}, Std: {predictions.std():.3f}")
+        print(f"Raw predictions - Min: {predictions.min():.3f}, Max: {predictions.max():.3f}")
         
-        # If predictions have low variance, add some noise for visualization
-        if predictions.std() < 0.1:
-            print("WARNING: Low prediction variance - adding noise for better visualization")
-            predictions = predictions + np.random.normal(0, 0.3, len(predictions))
-        
-        # Generate survival curves using exponential distribution
+        # For XGBoost AFT, predictions are log-scale parameters
+        # Convert to individual scale parameters for each employee
         survival_curves = []
-        for pred in predictions:
-            # Convert to scale parameter
+        scales = []
+        
+        for i, pred in enumerate(predictions):
+            # Use prediction directly as log-scale parameter
             scale = np.exp(pred)
-            scale = np.clip(scale, 50, 1000)  # Reasonable bounds
             
-            # Exponential survival function
+            # Ensure reasonable bounds but preserve variance
+            scale = np.clip(scale, 30, 2000)
+            scales.append(scale)
+            
+            # Generate exponential survival curve: S(t) = exp(-t/scale)
             curve = np.exp(-time_points / scale)
             survival_curves.append(curve)
         
@@ -600,12 +759,19 @@ class SurvivalAnalysis:
         
         # Validate curves
         final_survival = self.survival_curves[:, -1]
+        scales_array = np.array(scales)
+        
+        print(f"Scale parameters - Mean: {scales_array.mean():.1f}, Std: {scales_array.std():.1f}")
+        print(f"Scale parameters - Min: {scales_array.min():.1f}, Max: {scales_array.max():.1f}")
         print(f"Final survival - Mean: {final_survival.mean():.3f}, Std: {final_survival.std():.3f}")
+        
+        if final_survival.std() < 0.01:
+            print("WARNING: Very low survival curve variance - check model predictions")
         
         return self.survival_curves
     
     def plot_individual_survival_curves(self, n_curves=5):
-        """Plot individual survival curves"""
+        """Plot individual survival curves with detailed diagnostics"""
         if self.survival_curves is None:
             print("No survival curves generated yet")
             return
@@ -613,14 +779,32 @@ class SurvivalAnalysis:
         plt.figure(figsize=(12, 8))
         colors = ['blue', 'orange', 'green', 'red', 'purple']
         
+        print(f"Plotting {min(n_curves, len(self.survival_curves))} survival curves:")
+        
         for i in range(min(n_curves, len(self.survival_curves))):
             curve = self.survival_curves[i]
+            
+            # Print diagnostics for each curve
+            curve_slope = curve[0] - curve[-1]  # Should be positive (declining)
+            print(f"   Employee {i+1}: Initial={curve[0]:.3f}, Final={curve[-1]:.3f}, Slope={curve_slope:.3f}")
+            
             plt.plot(self.time_points, curve, color=colors[i], linewidth=2,
                     label=f'Employee {i+1} (final: {curve[-1]:.3f})')
         
         # Add mean curve
         mean_curve = np.mean(self.survival_curves, axis=0)
         plt.plot(self.time_points, mean_curve, 'k--', linewidth=3, alpha=0.7, label='Mean')
+        
+        # Add some statistics
+        final_survivals = self.survival_curves[:, -1]
+        print(f"Final survival statistics:")
+        print(f"   Mean: {final_survivals.mean():.3f}")
+        print(f"   Std: {final_survivals.std():.3f}")
+        print(f"   Min: {final_survivals.min():.3f}")
+        print(f"   Max: {final_survivals.max():.3f}")
+        
+        if final_survivals.std() < 0.01:
+            print("   WARNING: Very low variance in final survival probabilities")
         
         plt.xlabel('Time (days)')
         plt.ylabel('Survival Probability')
@@ -634,37 +818,66 @@ class SurvivalAnalysis:
     
     def calculate_lorenz_curve(self, y_true, y_pred_raw):
         """Calculate Lorenz curve using raw predictions"""
-        # Use raw predictions as risk scores
-        y_pred_risk = -y_pred_raw  # Negative because lower survival time = higher risk
+        # For XGBoost AFT: higher predictions = longer survival time = lower risk
+        # So we use predictions directly as survival time predictions
+        y_pred_risk = 1.0 / (y_pred_raw + 1e-6)  # Inverse relationship: higher survival time = lower risk
         
         df = pd.DataFrame({
             'event': y_true,
             'predicted_risk': y_pred_risk
         })
         
-        # Sort by predicted risk
+        print(f"Risk scores - Mean: {y_pred_risk.mean():.6f}, Std: {y_pred_risk.std():.6f}")
+        print(f"Risk scores - Min: {y_pred_risk.min():.6f}, Max: {y_pred_risk.max():.6f}")
+        
+        # Sort by predicted risk (descending - highest risk first)
         df = df.sort_values('predicted_risk', ascending=False).reset_index(drop=True)
         
         # Create deciles
-        df['decile'] = pd.qcut(range(len(df)), 10, labels=False)
+        n_deciles = 10
+        decile_size = len(df) // n_deciles
         
-        # Calculate cumulative events
-        decile_events = df.groupby('decile')['event'].sum()
+        cumulative_events = []
+        cumulative_population = []
+        
+        for i in range(n_deciles):
+            start_idx = i * decile_size
+            end_idx = (i + 1) * decile_size if i < n_deciles - 1 else len(df)
+            
+            # Events in this decile and all previous
+            events_so_far = df.iloc[:end_idx]['event'].sum()
+            population_so_far = end_idx
+            
+            cumulative_events.append(events_so_far)
+            cumulative_population.append(population_so_far)
+        
+        # Convert to proportions
         total_events = df['event'].sum()
+        total_population = len(df)
         
         if total_events == 0:
             print("WARNING: No events for Lorenz curve")
             return 0.0
         
-        cumulative_events = decile_events.cumsum() / total_events
-        cumulative_population = np.arange(1, 11) / 10
+        cumulative_events_prop = np.array(cumulative_events) / total_events
+        cumulative_population_prop = np.array(cumulative_population) / total_population
         
-        # Calculate Gini coefficient
-        gini = 1 - 2 * np.trapz(cumulative_events, cumulative_population)
+        # Calculate Gini coefficient using the area under the curve
+        # Perfect model would have area = 0.5, random model has area = 0.5
+        # Gini = 1 - 2 * area_under_curve
+        
+        # Add origin point
+        x_vals = np.concatenate([[0], cumulative_population_prop])
+        y_vals = np.concatenate([[0], cumulative_events_prop])
+        
+        area_under_curve = np.trapz(y_vals, x_vals)
+        gini = 1 - 2 * area_under_curve
+        
+        print(f"Total events: {total_events}, Area under curve: {area_under_curve:.4f}")
         
         self.enhanced_results['lorenz_curve'] = {
-            'cumulative_events': cumulative_events,
-            'cumulative_population': cumulative_population,
+            'cumulative_events': cumulative_events_prop,
+            'cumulative_population': cumulative_population_prop,
             'gini_coefficient': gini
         }
         
@@ -726,7 +939,7 @@ class SurvivalAnalysis:
         return c_indices
     
     def run_enhanced_analysis(self) -> Dict:
-        """Run enhanced analysis with improvements"""
+        """Run enhanced analysis with comprehensive diagnostics"""
         print("RUNNING ENHANCED SURVIVAL ANALYSIS")
         print("=" * 50)
         
@@ -740,6 +953,9 @@ class SurvivalAnalysis:
         if 'model' not in self.insights:
             print("Model not trained - cannot run enhanced analysis")
             return {'insights': self.insights}
+        
+        # Add comprehensive model diagnostics
+        model_diagnostics = self.diagnose_model_learning()
         
         # Get validation data
         X_val = self.model_data['X_val']
@@ -758,13 +974,18 @@ class SurvivalAnalysis:
         print("\n3. Time-dependent performance...")
         self.calculate_time_dependent_cindex(y_val, event_val, raw_predictions)
         
-        # Generate summary
+        # Generate summary with recommendations
         enhanced_summary = self.generate_enhanced_summary()
+        
+        print("\n" + "="*50)
+        print("ANALYSIS COMPLETE")
+        print("="*50)
         
         return {
             'insights': self.insights,
             'enhanced_results': self.enhanced_results,
-            'enhanced_summary': enhanced_summary
+            'enhanced_summary': enhanced_summary,
+            'model_diagnostics': model_diagnostics
         }
     
     def generate_enhanced_summary(self) -> Dict:
@@ -823,6 +1044,23 @@ class SurvivalAnalysis:
 
 # Usage
 if __name__ == "__main__":
+    # Example usage:
+    # 1. Load your employee data
+    # data = df.select(*final_cols).toPandas()
+    
+    # 2. Initialize analyzer
     # analyzer = SurvivalAnalysis(data)
+    
+    # 3. Run enhanced analysis with diagnostics
     # results = analyzer.run_enhanced_analysis()
+    
+    # 4. Check recommendations
+    # recommendations = results['enhanced_summary']['recommendations']
+    # for rec in recommendations:
+    #     print(f"Issue: {rec['issue']}")
+    #     print(f"Recommendation: {rec['recommendation']}")
+    
+    # 5. Or run original analysis
+    # results = analyzer.run_complete_analysis()
+    
     pass
