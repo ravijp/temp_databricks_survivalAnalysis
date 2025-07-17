@@ -573,10 +573,13 @@ class EnhancedSurvivalAnalysis:
         y_train = self.model_data['y_train']
         
         dtrain = xgb.DMatrix(X_train)
-        eta_predictions = self.model.predict(dtrain)
+        eta_predictions = self.model.predict(dtrain)  # These are log-scale location parameters
         
-        log_residuals = np.log(y_train) - eta_predictions
+        # Calculate residuals in log space: log(actual) - predicted_log_scale
+        log_actual = np.log(y_train)
+        log_residuals = log_actual - eta_predictions
         
+        # Estimate scale parameter based on distribution
         if self.aft_distribution == AFTDistribution.NORMAL:
             sigma = np.std(log_residuals)
         elif self.aft_distribution == AFTDistribution.LOGISTIC:
@@ -586,11 +589,21 @@ class EnhancedSurvivalAnalysis:
         else:
             sigma = np.std(log_residuals)
         
-        sigma = np.clip(sigma, 0.1, 5.0)
+        # Ensure reasonable bounds
+        sigma = np.clip(sigma, 0.1, 3.0)
         
         print(f"AFT Parameter Estimation:")
-        print(f"   Location parameters - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
-        print(f"   Scale parameter: {sigma:.3f}")
+        print(f"   Predictions (η) - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
+        print(f"   Log actual times - Mean: {log_actual.mean():.3f}, Std: {log_actual.std():.3f}")
+        print(f"   Log residuals - Mean: {log_residuals.mean():.3f}, Std: {np.std(log_residuals):.3f}")
+        print(f"   Estimated scale (σ): {sigma:.3f}")
+        
+        # Check for potential issues
+        if eta_predictions.std() < 0.01:
+            print("   WARNING: Very low prediction variance - model may not be learning!")
+        
+        if abs(log_residuals.mean()) > 0.5:
+            print(f"   WARNING: Large bias in predictions (mean residual: {log_residuals.mean():.3f})")
         
         return AFTParameters(
             eta=eta_predictions,
@@ -619,27 +632,35 @@ class EnhancedSurvivalAnalysis:
             raise ValueError("Model parameters not estimated. Run build_enhanced_predictive_model() first.")
         
         dtest = xgb.DMatrix(X_test)
-        eta_predictions = self.model.predict(dtest)
+        eta_predictions = self.model.predict(dtest)  # These are log-scale location parameters
         
         print(f"AFT Survival Curve Generation:")
-        print(f"   Location parameters - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
-        print(f"   Scale parameter: {self.model_parameters.sigma:.3f}")
+        print(f"   Location parameters (η) - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
+        print(f"   Scale parameter (σ): {self.model_parameters.sigma:.3f}")
         print(f"   Distribution: {self.aft_distribution.value}")
+        
+        # Check if model is learning (predictions should have variance)
+        if eta_predictions.std() < 0.01:
+            print("   WARNING: Very low prediction variance - model may not be learning!")
         
         survival_curves = []
         
         for eta in eta_predictions:
+            # Standard AFT survival functions where eta is log-scale location parameter
             if self.aft_distribution == AFTDistribution.NORMAL:
+                # Normal AFT: S(t) = 1 - Φ((log(t) - η)/σ)
                 log_times = np.log(time_points)
                 z_scores = (log_times - eta) / self.model_parameters.sigma
                 survival_probs = 1 - stats.norm.cdf(z_scores)
                 
             elif self.aft_distribution == AFTDistribution.LOGISTIC:
+                # Logistic AFT: S(t) = 1 / (1 + exp((log(t) - η)/σ))
                 log_times = np.log(time_points)
                 z_scores = (log_times - eta) / self.model_parameters.sigma
                 survival_probs = 1 / (1 + np.exp(z_scores))
                 
             elif self.aft_distribution == AFTDistribution.EXTREME:
+                # Extreme value AFT: S(t) = exp(-exp((log(t) - η)/σ))
                 log_times = np.log(time_points)
                 z_scores = (log_times - eta) / self.model_parameters.sigma
                 survival_probs = np.exp(-np.exp(z_scores))
@@ -647,20 +668,42 @@ class EnhancedSurvivalAnalysis:
             else:
                 raise ValueError(f"Unsupported AFT distribution: {self.aft_distribution}")
             
-            survival_probs = np.clip(survival_probs, 0, 1)
+            # Ensure valid probabilities
+            survival_probs = np.clip(survival_probs, 1e-6, 1.0 - 1e-6)
             survival_curves.append(survival_probs)
         
         self.survival_curves = np.array(survival_curves)
         self.time_points = time_points
         
+        # Diagnostic information
         final_survival = self.survival_curves[:, -1]
-        print(f"   Final survival probabilities - Mean: {final_survival.mean():.3f}, Std: {final_survival.std():.3f}")
+        initial_survival = self.survival_curves[:, 0]
+        
+        print(f"   Survival Curve Diagnostics:")
+        print(f"     Initial survival (t=1) - Mean: {initial_survival.mean():.3f}, Std: {initial_survival.std():.3f}")
+        print(f"     Final survival (t=365) - Mean: {final_survival.mean():.3f}, Std: {final_survival.std():.3f}")
+        print(f"     Average decline: {(initial_survival.mean() - final_survival.mean()):.3f}")
+        
+        # Check for issues
+        if final_survival.std() < 0.01:
+            print("   WARNING: Low variance in final survival probabilities")
+            print("   Possible issues: low prediction variance, inappropriate sigma, or model not learning")
+        
+        if final_survival.mean() > 0.95:
+            print("   WARNING: Very high final survival probabilities")
+            print("   Possible issues: sigma too large, or time horizon too short relative to predictions")
         
         return self.survival_curves
     
     def calculate_risk_scores(self, predictions: np.ndarray) -> np.ndarray:
         """Calculate mathematically correct risk scores for AFT models"""
-        risk_scores = -predictions
+        # XGBoost AFT predictions are log-scale location parameters (η)
+        # Higher η means longer expected survival time = lower risk
+        # Convert to risk scores: risk = -η (normalized to [0,1])
+        
+        risk_scores = -predictions  # Higher log-survival time = lower risk
+        
+        # Normalize to [0, 1] range
         risk_scores = risk_scores - risk_scores.min()
         if risk_scores.max() > 0:
             risk_scores = risk_scores / risk_scores.max()
@@ -957,8 +1000,8 @@ class EnhancedSurvivalAnalysis:
         ax2.hist(final_survivals, bins=50, alpha=0.7, density=True, color='skyblue')
         ax2.axvline(final_survivals.mean(), color='red', linestyle='--', linewidth=2, 
                    label=f'Mean: {final_survivals.mean():.3f}')
-        ax2.axvline(final_survivals.median(), color='orange', linestyle='--', linewidth=2, 
-                   label=f'Median: {final_survivals.median():.3f}')
+        ax2.axvline(np.median(final_survivals), color='orange', linestyle='--', linewidth=2, 
+                   label=f'Median: {np.median(final_survivals):.3f}')
         
         ax2.set_xlabel('Final Survival Probability', fontsize=12)
         ax2.set_ylabel('Density', fontsize=12)
@@ -977,7 +1020,7 @@ class EnhancedSurvivalAnalysis:
         print(f"   Coefficient of variation: {final_survivals.std() / final_survivals.mean():.3f}")
     
     def validate_enhanced_model(self) -> Dict:
-        """Comprehensive model validation"""
+        """Comprehensive model validation with enhanced diagnostics"""
         print("\nCOMPREHENSIVE MODEL VALIDATION")
         print("=" * 40)
         
@@ -989,11 +1032,26 @@ class EnhancedSurvivalAnalysis:
         predictions = self.model.predict(dval)
         
         print("1. PREDICTION DISTRIBUTION:")
-        print(f"   Mean: {predictions.mean():.3f}")
-        print(f"   Std: {predictions.std():.3f}")
-        print(f"   Range: [{predictions.min():.3f}, {predictions.max():.3f}]")
+        print(f"   Mean: {predictions.mean():.3f} (log-scale)")
+        print(f"   Std: {predictions.std():.3f} (log-scale)")
+        print(f"   Range: [{predictions.min():.3f}, {predictions.max():.3f}] (log-scale)")
+        print(f"   Equivalent survival times: [{np.exp(predictions.min()):.1f}, {np.exp(predictions.max()):.1f}] days")
+        print(f"   Unique predictions: {len(np.unique(predictions))}")
         
-        print("\n2. DIRECTIONAL VALIDATION:")
+        # Check if predictions are reasonable
+        if predictions.std() < 0.01:
+            print("   WARNING: Very low prediction variance!")
+        if len(np.unique(predictions)) < 10:
+            print("   WARNING: Very few unique predictions!")
+        
+        print("\n2. PREDICTION vs ACTUAL CORRELATION:")
+        from scipy.stats import pearsonr, spearmanr
+        corr_pearson, p_pearson = pearsonr(predictions, y_val)
+        corr_spearman, p_spearman = spearmanr(predictions, y_val)
+        print(f"   Pearson correlation: {corr_pearson:.3f} (p={p_pearson:.3e})")
+        print(f"   Spearman correlation: {corr_spearman:.3f} (p={p_spearman:.3e})")
+        
+        print("\n3. DIRECTIONAL VALIDATION:")
         high_pred_mask = predictions >= np.median(predictions)
         low_pred_mask = predictions < np.median(predictions)
         
@@ -1005,16 +1063,34 @@ class EnhancedSurvivalAnalysis:
         direction_correct = high_survival > low_survival
         event_direction_correct = high_event_rate < low_event_rate
         
-        print(f"   High predictions longer survival: {direction_correct}")
-        print(f"   High predictions lower event rate: {event_direction_correct}")
+        print(f"   High predictions group:")
+        print(f"     Average actual survival: {high_survival:.1f} days")
+        print(f"     Event rate: {high_event_rate:.3f}")
+        print(f"   Low predictions group:")
+        print(f"     Average actual survival: {low_survival:.1f} days") 
+        print(f"     Event rate: {low_event_rate:.3f}")
+        print(f"   Direction correct (high pred = longer survival): {direction_correct}")
+        print(f"   Event direction correct (high pred = lower events): {event_direction_correct}")
         
-        print("\n3. SURVIVAL CURVE VALIDATION:")
+        print("\n4. SURVIVAL CURVE VALIDATION:")
         if self.survival_curves is not None:
             final_survival = self.survival_curves[:, -1]
-            print(f"   Final survival std: {final_survival.std():.3f}")
-            print(f"   Adequate variance: {final_survival.std() > 0.01}")
+            print(f"   Final survival probabilities:")
+            print(f"     Mean: {final_survival.mean():.3f}")
+            print(f"     Std: {final_survival.std():.3f}")
+            print(f"     Range: [{final_survival.min():.3f}, {final_survival.max():.3f}]")
+            
+            adequate_variance = final_survival.std() > 0.05
+            print(f"   Adequate variance: {adequate_variance}")
+            
+            # Check survival curve shapes
+            if len(self.survival_curves) > 0:
+                first_curve = self.survival_curves[0]
+                last_curve = self.survival_curves[-1]
+                curve_diff = abs(first_curve[-1] - last_curve[-1])
+                print(f"   Difference between extreme curves: {curve_diff:.3f}")
         
-        print("\n4. RISK RANKING VALIDATION:")
+        print("\n5. RISK RANKING VALIDATION:")
         if 'enhanced_lorenz_curve' in self.enhanced_results:
             decile_df = self.enhanced_results['enhanced_lorenz_curve']['decile_analysis']
             top_decile_event_rate = decile_df.iloc[0]['event_rate']
@@ -1025,13 +1101,38 @@ class EnhancedSurvivalAnalysis:
             print(f"   Bottom decile event rate: {bottom_decile_event_rate:.3f}")
             print(f"   Risk ranking correct: {ranking_correct}")
         
+        # Overall assessment
+        issues = []
+        if predictions.std() < 0.01:  # For log-scale parameters
+            issues.append("Low prediction variance")
+        if not direction_correct:
+            issues.append("Incorrect directional relationship")
+        if abs(corr_pearson) < 0.1:
+            issues.append("Low correlation with actual survival")
+        if self.survival_curves is not None and self.survival_curves[:, -1].std() < 0.05:
+            issues.append("Low survival curve variance")
+        
+        print(f"\n6. OVERALL ASSESSMENT:")
+        if not issues:
+            print("   Model appears to be working correctly!")
+        else:
+            print(f"   Issues detected: {', '.join(issues)}")
+            print("   Consider: feature engineering, hyperparameter tuning, or data quality checks")
+        
         return {
+            'prediction_stats': {
+                'mean': predictions.mean(),
+                'std': predictions.std(),
+                'correlation_pearson': corr_pearson,
+                'correlation_spearman': corr_spearman
+            },
             'direction_validation': {
                 'survival_direction_correct': direction_correct,
                 'event_direction_correct': event_direction_correct
             },
             'survival_curve_variance': final_survival.std() if self.survival_curves is not None else None,
-            'model_approach': 'AFT'
+            'issues': issues,
+            'overall_status': len(issues) == 0
         }
     
     def run_comprehensive_analysis(self) -> Dict:
